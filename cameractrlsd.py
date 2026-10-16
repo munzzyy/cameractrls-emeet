@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 
-import sys, os, ctypes, ctypes.util, logging, getopt, time
+import sys, os, ctypes, ctypes.util, json, logging, getopt, select, time
 from collections import namedtuple
 from struct import unpack_from, calcsize
-from cameractrls import CameraCtrls, find_symlink_in, get_configfilename
+from cameractrls import CameraCtrls, find_symlink_in, get_configfilename, get_configdir, daemon_status_path
 
 clib = ctypes.util.find_library('c')
 if clib is None:
@@ -73,6 +73,21 @@ def usage():
     print(f'optional arguments:')
     print(f'  -h, --help         show this help message and exit')
 
+STATUS_HEARTBEAT_S = 30
+status = {'pid': os.getpid(), 'started': time.time(), 'heartbeat': time.time(), 'last_applied': None}
+
+def write_status():
+    """The sandboxed launcher can't ask systemd about this unit, so it reads this file."""
+    status['heartbeat'] = time.time()
+    path = daemon_status_path()
+    try:
+        os.makedirs(get_configdir(), mode=0o755, exist_ok=True)
+        with open(f'{path}.tmp', 'w', encoding='utf-8') as f:
+            json.dump(status, f)
+        os.replace(f'{path}.tmp', path)
+    except OSError as e:
+        logging.warning(f'can\'t write {path}: {e}')
+
 def preset_device(device):
     logging.debug(f'trying to preset_device: {device}')
 
@@ -94,11 +109,16 @@ def preset_device(device):
     errs = []
 
     camera_ctrls = CameraCtrls(device, fd)
+    # the daemon restores controls only, the capture format belongs to whoever is streaming
+    camera_ctrls.config_preset.restore_format = False
     camera_ctrls.setup_ctrls({'preset': 'load_1'}, errs)
     if errs:
         logging.warning(f'preset_device: failed to load_1: {errs}')
 
     os.close(fd)
+    if not errs:
+        status['last_applied'] = time.time()
+        write_status()
 
 Event = namedtuple('Event', ['wd', 'mask', 'cookie', 'namesize', 'name'])
 EVENT_FMT = 'iIII'
@@ -127,6 +147,8 @@ def main():
             usage()
             return 0
 
+    write_status()
+
     dev_path = '/dev'
     v4l_paths = ['/dev/v4l/by-id/', '/dev/v4l/by-path/']
 
@@ -146,6 +168,9 @@ def main():
         return 1
 
     while True:
+        if not select.select([fd], [], [], STATUS_HEARTBEAT_S)[0]:
+            write_status()
+            continue
         data = os.read(fd, EVENT_SIZE + NAME_MAX + 1)
         for e in parse_events(data):
             logging.debug(f'event: {e}')

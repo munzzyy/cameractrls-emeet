@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 
-import ctypes, ctypes.util, logging, os.path, getopt, sys, subprocess, select, time, math, configparser
+import contextlib, struct, ctypes, ctypes.util, json, logging, os.path, getopt, sys, subprocess, select, time, math, configparser
 from fcntl import ioctl
-from threading import Thread
-from errno import EIO
+from threading import Thread, Event
+from errno import EIO, EBUSY
+
+import emcheck
+from emhid import EmeetHid, EmeetHidError, RemoteWatcher, open_hid_readonly, read_pushes
 
 ghurl = 'https://github.com/soyersoyer/cameractrls'
 version = 'v0.6.10'
@@ -61,6 +64,32 @@ def get_devices(dirs):
             resolved_devices.append(resolved)
     devices.sort()
     return devices
+
+def find_device_holders(path):
+    """(pid, command) of the other processes that have the device open, read from /proc/*/fd (no root).
+    Processes outside our PID namespace, e.g. from inside a Flatpak, are not visible."""
+    target = os.path.realpath(path)
+    me = os.getpid()
+    holders = []
+    for entry in os.listdir('/proc'):
+        if not entry.isdigit() or int(entry) == me:
+            continue
+        fd_dir = f'/proc/{entry}/fd'
+        try:
+            fds = os.listdir(fd_dir)
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            # the process exited, or belongs to someone else
+            continue
+        for fd in fds:
+            try:
+                if os.path.realpath(f'{fd_dir}/{fd}') != target:
+                    continue
+                with open(f'/proc/{entry}/comm', encoding='utf-8') as f:
+                    holders.append((int(entry), f.read().strip()))
+            except (FileNotFoundError, PermissionError, ProcessLookupError):
+                break
+            break
+    return sorted(holders)
 
 ptz_hw_executables = [
     f'{sys.path[0]}/cameraptzspnav.py',
@@ -301,6 +330,7 @@ class v4l2_plane_pix_format(ctypes.Structure):
         ('reserved', ctypes.c_uint16 * 6),
     ]
     _pack_ = True
+    _layout_ = 'ms'
 
 
 class v4l2_pix_format_mplane(ctypes.Structure):
@@ -327,6 +357,7 @@ class v4l2_pix_format_mplane(ctypes.Structure):
 
     _anonymous_ = ('_u',)
     _pack_ = True
+    _layout_ = 'ms'
 
 class v4l2_rect(ctypes.Structure):
     _fields_ = [
@@ -833,6 +864,7 @@ class v4l2_querymenu(ctypes.Structure):
     ]
     _anonymous_ = ('_u',)
     _pack_ = True
+    _layout_ = 'ms'
 
 class uvc_xu_control_query(ctypes.Structure):
     _fields_ = [
@@ -1125,6 +1157,143 @@ def collect_warning(w, ws):
     ws.append(w)
     return ws
 
+class ShortStream:
+    """Holds a capture open on the device's current format for the length of a with block. The C60E only takes an
+    auto_exposure mode write while a stream runs. A device that is already streaming (the preview, the viewer, OBS)
+    refuses the buffer request with EBUSY, and then nothing needs opening."""
+
+    BUFFERS = 2
+
+    def __init__(self, device):
+        self.device = device
+        self.fd = None
+        self.streaming = False
+        self.requested = False
+
+    def __enter__(self):
+        try:
+            fd = os.open(self.device, os.O_RDWR)
+        except OSError as e:
+            logging.info(f'ShortStream: can\'t open {self.device}: {e}')
+            return self
+        try:
+            req = v4l2_requestbuffers()
+            req.count = self.BUFFERS
+            req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE
+            req.memory = V4L2_MEMORY_MMAP
+            ioctl(fd, VIDIOC_REQBUFS, req)
+            self.requested = True
+            for i in range(req.count):
+                buf = v4l2_buffer()
+                buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE
+                buf.memory = V4L2_MEMORY_MMAP
+                buf.index = i
+                ioctl(fd, VIDIOC_QBUF, buf)
+            ioctl(fd, VIDIOC_STREAMON, struct_pack_int(V4L2_BUF_TYPE_VIDEO_CAPTURE))
+        except OSError as e:
+            if e.errno == EBUSY:
+                logging.debug(f'ShortStream: {self.device} is already streaming')
+            else:
+                logging.info(f'ShortStream: can\'t stream {self.device}: {e}')
+            self.fd = fd
+            self.release()
+            return self
+        self.fd = fd
+        self.streaming = True
+        return self
+
+    def release(self):
+        fd, self.fd = self.fd, None
+        if fd is None:
+            return
+        try:
+            if self.streaming:
+                ioctl(fd, VIDIOC_STREAMOFF, struct_pack_int(V4L2_BUF_TYPE_VIDEO_CAPTURE))
+            if self.requested:
+                req = v4l2_requestbuffers()
+                req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE
+                req.memory = V4L2_MEMORY_MMAP
+                ioctl(fd, VIDIOC_REQBUFS, req)
+        except OSError as e:
+            logging.info(f'ShortStream: release on {self.device}: {e}')
+        finally:
+            self.streaming = self.requested = False
+            os.close(fd)
+
+    def __exit__(self, *exc):
+        self.release()
+        return False
+
+def struct_pack_int(v):
+    return struct.pack('I', v)
+
+USBDEVFS_RESET = 0x5514
+EMEET_C60E_IDS = ('328f', '00e1')
+
+def usb_device_dir(video_node):
+    """The sysfs directory of the USB device behind a video node, or None."""
+    name = os.path.basename(os.path.realpath(video_node))
+    d = os.path.realpath(f'/sys/class/video4linux/{name}/device')
+    while d not in ('/', ''):
+        if os.path.exists(f'{d}/busnum') and os.path.exists(f'{d}/devnum'):
+            return d
+        d = os.path.dirname(d)
+    return None
+
+def usb_reset(video_node):
+    """USBDEVFS_RESET on the C60E behind video_node. Returns (ok, message)."""
+    d = usb_device_dir(video_node)
+    if d is None:
+        return False, f'Can\'t find the USB device behind {video_node}'
+    def read(name):
+        with open(f'{d}/{name}') as f:
+            return f.read().strip()
+    try:
+        ids = (read('idVendor'), read('idProduct'))
+        path = '/dev/bus/usb/%03d/%03d' % (int(read('busnum')), int(read('devnum')))
+    except (OSError, ValueError) as e:
+        return False, f'Can\'t read the USB device description: {e}'
+    if ids != EMEET_C60E_IDS:
+        return False, f'{video_node} is not an EMEET C60E, not resetting it'
+    try:
+        fd = os.open(path, os.O_WRONLY)
+    except PermissionError:
+        return False, (f'Can\'t reset the camera: no write access to {path}. Install 70-emeet-c60e.rules from the '
+            'uvcvideo-emeet repo (it gives the logged-in user the USB device), then replug the camera.')
+    except OSError as e:
+        return False, f'Can\'t open {path}: {e}'
+    try:
+        ioctl(fd, USBDEVFS_RESET, 0)
+    except OSError as e:
+        return False, f'USB reset failed: {e}'
+    finally:
+        os.close(fd)
+    return True, 'The camera was reset and is coming back'
+
+def wait_for_node(path, timeout=10.0, settle=1.0, sleep=time.sleep):
+    """True once `path` exists again after a reset, after a short settle."""
+    end = time.monotonic() + timeout
+    seen_gone = False
+    while time.monotonic() < end:
+        if os.path.exists(path):
+            if seen_gone or time.monotonic() > end - timeout + 1.5:
+                sleep(settle)
+                return True
+        else:
+            seen_gone = True
+        sleep(0.2)
+    return False
+
+def write_verified(write, read, want, retries=3, pause=0.2, sleep=time.sleep):
+    """write(want), then read() must give want back. Up to `retries` more writes, `pause` seconds apart."""
+    for attempt in range(retries + 1):
+        write(want)
+        if read() == want:
+            return True
+        if attempt < retries:
+            sleep(pause)
+    return False
+
 class BaseCtrl:
     def __init__(self, text_id, name, type, value = None, default = None, min = None, max = None, step = None,
                 inactive = False, reopener = False, menu_dd = False, menu = None, tooltip = None, child_tooltip = None,
@@ -1152,6 +1321,7 @@ class BaseCtrl:
         self.format_value = format_value
         self.step_big = step_big
         self.unrestorable = unrestorable
+        self.value_tooltip = None
 
 class BaseCtrlMenu:
     def __init__(self, text_id, name, value, gui_hidden=False, lp_text_id=None):
@@ -1867,6 +2037,451 @@ ANKERWORK_MIC_PICKUP_MODE_LENGTH = 0x2
 ANKERWORK_MIC_PICKUP_360 = 0x0
 ANKERWORK_MIC_PICKUP_90 = 0x5a
 
+EMEET_C60E_USB_ID = '328f:00e1'
+
+# (label, zoom_absolute value); None hides the menu
+EMEET_C60E_ZOOM_STEPS = [
+    ('Wide 1x', 0),
+    ('Wide 1.5x', 160),
+    ('Tele', 170),
+    ('Tele mid', 285),
+    ('Tele max', 400),
+]
+
+# zoom_absolute below this is the wide lens, from here up the tele lens
+EMEET_C60E_TELE_FROM = 170
+
+# what the remote's Reset button puts back
+EMEET_C60E_RESET_CTRLS = [
+    'brightness', 'contrast', 'saturation', 'hue', 'gamma', 'sharpness',
+    'backlight_compensation', 'zoom_absolute',
+]
+
+EMEET_C60E_LIGHT_FACTORY = '00ddff'
+
+EMEET_C60E_LIGHT_SWATCHES = [
+    ('red', 'Red', 'ff0000'),
+    ('green', 'Green', '00ff00'),
+    ('blue', 'Blue', '0000ff'),
+    ('white', 'White', 'ffffff'),
+    ('off', 'Off', '000000'),
+    ('factory', 'Factory', EMEET_C60E_LIGHT_FACTORY),
+]
+
+def parse_hex_color(text):
+    t = str(text).strip().lstrip('#').lower()
+    if len(t) != 6 or any(ch not in '0123456789abcdef' for ch in t):
+        return None
+    return tuple(int(t[i:i + 2], 16) for i in (0, 2, 4))
+
+def format_hex_color(rgb):
+    return '%02x%02x%02x' % tuple(rgb)
+
+def emeet_step_id(label):
+    return label.lower().replace('.', '_').replace(' ', '_')
+
+class EmeetC60ECtrls:
+    """EMEET SmartCam C60E 4K Dual: shortcuts built on the standard UVC controls."""
+
+    def __init__(self, device, fd, cam_ctrls):
+        self.cam_ctrls = cam_ctrls
+        self.ctrls = []
+        if find_usb_ids_in_sysfs(device) != EMEET_C60E_USB_ID:
+            return
+
+        self.hid = EmeetHid()
+        self.add_hid_ctrls()
+        self.ctrls.append(BaseCtrl('emeet_c60e_reset_image', 'Reset image', 'button',
+            tooltip = 'Put brightness, contrast, saturation, hue, gamma, sharpness, backlight compensation and zoom back to their defaults',
+            menu = [BaseCtrlMenu('reset', 'Reset', 'reset')],
+            reopener = True,
+        ))
+
+        if EMEET_C60E_ZOOM_STEPS:
+            self.ctrls.append(BaseCtrl('emeet_c60e_zoom_step', 'Zoom step', 'menu',
+                tooltip = 'Jump to a fixed zoom level',
+                menu = [BaseCtrlMenu(emeet_step_id(label), label, zoom) for label, zoom in EMEET_C60E_ZOOM_STEPS],
+                menu_dd = True,
+                unrestorable = True,
+                value = self.current_zoom_step(),
+            ))
+            self.ctrls.append(BaseCtrl('emeet_c60e_lens', 'Lens', 'info',
+                tooltip = f'Which lens is active: wide below zoom {EMEET_C60E_TELE_FROM}, tele from there up',
+                value = self.current_lens(),
+            ))
+
+    def add_hid_ctrls(self):
+        try:
+            serial = self.hid.get_serial()
+            firmware = self.hid.get_version()
+            light = format_hex_color(self.hid.get_light())
+        except EmeetHidError as e:
+            logging.debug(f'EmeetC60ECtrls: HID unavailable: {e}')
+            for text_id, name in (('emeet_c60e_light_note', 'Light colour'), ('emeet_c60e_info_note', 'Serial, firmware')):
+                self.ctrls.append(BaseCtrl(text_id, name, 'info', str(e), tooltip = 'Needs the camera\'s HID node'))
+            return
+        self.ctrls.append(BaseCtrl('emeet_c60e_serial', 'Serial', 'info', serial,
+            tooltip = 'Serial number, read from the camera over its HID node'))
+        self.ctrls.append(BaseCtrl('emeet_c60e_firmware', 'Firmware', 'info', firmware,
+            tooltip = 'Firmware version, read from the camera over its HID node'))
+        self.ctrls.append(BaseCtrl('emeet_c60e_light', 'Light colour', 'color', light,
+            default = EMEET_C60E_LIGHT_FACTORY,
+            menu = [BaseCtrlMenu(text_id, name, value) for text_id, name, value in EMEET_C60E_LIGHT_SWATCHES],
+            tooltip = 'Colour of the light on the camera. Type a hex colour on the CLI, eg. emeet_c60e_light=ff0000',
+        ))
+
+    def set_light(self, value, errs):
+        ctrl = find_by_text_id(self.ctrls, 'emeet_c60e_light')
+        swatch = find_by_text_id(ctrl.menu, value)
+        rgb = parse_hex_color(swatch.value if swatch else value)
+        if rgb is None:
+            collect_warning(f'EmeetC60ECtrls: {value} is not a colour (use rrggbb or one of {[m.text_id for m in ctrl.menu]})', errs)
+            return
+        try:
+            self.hid.set_light(*rgb)
+            rgb = self.hid.get_light()
+        except EmeetHidError as e:
+            collect_warning(f'EmeetC60ECtrls: {e}', errs)
+            return
+        ctrl.value = format_hex_color(rgb)
+
+    def current_zoom(self):
+        zoom = self.cam_ctrls.v4l_ctrls.find_by_v4l2_id(V4L2_CID_ZOOM_ABSOLUTE)
+        return None if zoom is None else zoom.value
+
+    def current_zoom_step(self):
+        zoom = self.current_zoom()
+        return next((emeet_step_id(label) for label, z in EMEET_C60E_ZOOM_STEPS if z == zoom), None)
+
+    def current_lens(self):
+        zoom = self.current_zoom()
+        if zoom is None:
+            return ''
+        return 'Wide' if zoom < EMEET_C60E_TELE_FROM else 'Tele'
+
+    def related_ctrls(self, ctrl):
+        """Controls to resync in the UI after ctrl changed."""
+        zoom_step = find_by_text_id(self.ctrls, 'emeet_c60e_zoom_step')
+        lens = find_by_text_id(self.ctrls, 'emeet_c60e_lens')
+        if zoom_step is None or lens is None:
+            return []
+        if ctrl.text_id == 'zoom_absolute':
+            zoom_step.value = self.current_zoom_step()
+            lens.value = self.current_lens()
+            return [zoom_step, lens]
+        if ctrl is zoom_step:
+            lens.value = self.current_lens()
+            return [self.cam_ctrls.v4l_ctrls.find_by_v4l2_id(V4L2_CID_ZOOM_ABSOLUTE), lens]
+        return []
+
+    def get_ctrls(self):
+        return self.ctrls
+
+    def setup_ctrls(self, params, errs):
+        for k, v in params.items():
+            ctrl = find_by_text_id(self.ctrls, k)
+            if ctrl is None or ctrl.type == 'info':
+                continue
+            if ctrl.text_id == 'emeet_c60e_reset_image':
+                self.reset_image(errs)
+            elif ctrl.text_id == 'emeet_c60e_light':
+                self.set_light(v, errs)
+            elif ctrl.text_id == 'emeet_c60e_zoom_step':
+                menu = find_by_text_id(ctrl.menu, v)
+                if menu is None:
+                    collect_warning(f'EmeetC60ECtrls: Can\'t find {v} in {[c.text_id for c in ctrl.menu]}', errs)
+                    continue
+                self.cam_ctrls.v4l_ctrls.setup_ctrls({'zoom_absolute': menu.value}, errs)
+                ctrl.value = menu.text_id
+                find_by_text_id(self.ctrls, 'emeet_c60e_lens').value = self.current_lens()
+
+    def reset_image(self, errs):
+        v4l_ctrls = self.cam_ctrls.v4l_ctrls
+        defaults = {}
+        for text_id in EMEET_C60E_RESET_CTRLS:
+            c = find_by_text_id(v4l_ctrls.get_ctrls(), text_id)
+            if c is not None and not c.inactive and not c.readonly and c.default is not None:
+                defaults[text_id] = c.default
+        v4l_ctrls.setup_ctrls(defaults, errs)
+
+# zoom_absolute -> magnification of the wide view, measured on the unit
+EMEET_C60E_ZOOM_FACTORS = [(0, 1.0), (165, 1.5), (170, 1.6), (260, 2.0), (320, 2.4), (400, 3.2)]
+
+def emeet_zoom_factor(zoom):
+    points = EMEET_C60E_ZOOM_FACTORS
+    if zoom <= points[0][0]:
+        return points[0][1]
+    for (z0, f0), (z1, f1) in zip(points, points[1:]):
+        if zoom <= z1:
+            return f0 + (f1 - f0) * (zoom - z0) / (z1 - z0)
+    return points[-1][1]
+
+def emeet_zoom_text(zoom):
+    lens = 'Wide' if zoom < EMEET_C60E_TELE_FROM else 'Tele'
+    return f'{zoom:.0f} (about {emeet_zoom_factor(zoom):.1f}x, {lens})'
+
+EMEET_REMOTE_SECTION = 'remote_steps'
+EMEET_REMOTE_STEPS = [('1x', 0), ('3x', 100), ('5x', 200), ('7x', 300), ('11x', 400)]
+EMEET_REMOTE_ZOOM_STEP = 10
+EMEET_REMOTE_LEVEL_STEP = 8
+
+class EmeetC60ERemoteCtrls:
+    """The IR remote's buttons that the host can do, as button rows on the Basic page."""
+
+    def __init__(self, device, fd, cam_ctrls):
+        self.cam_ctrls = cam_ctrls
+        self.ctrls = []
+        self.level_ids = {'emeet_remote_brightness': V4L2_CID_BRIGHTNESS, 'emeet_remote_sharpness': V4L2_CID_SHARPNESS,
+            'emeet_remote_color': V4L2_CID_SATURATION}
+        self.steps = dict(EMEET_REMOTE_STEPS)
+        self.custom = set()
+        if find_usb_ids_in_sysfs(device) != EMEET_C60E_USB_ID:
+            return
+
+        self.read_steps()
+        zoom_row = self.zoom_ctrl()
+        if zoom_row is not None:
+            zoom_row.format_value = lambda scale, value: emeet_zoom_text(value)
+        zoom = BaseCtrl('emeet_remote_zoom', 'Zoom', 'button',
+            tooltip = 'Zoom in or out by 10, hold to repeat',
+            menu = [BaseCtrlMenu('zoom_out', 'Zoom out', 'zoom_out'), BaseCtrlMenu('zoom_in', 'Zoom in', 'zoom_in')],
+        )
+        zoom.hold_repeat = True
+        self.ctrls.append(zoom)
+        self.ctrls.append(BaseCtrl('emeet_remote_step', 'Zoom steps', 'button',
+            tooltip = 'The remote\'s 1X 3X 5X 7X 11X buttons',
+            menu = [BaseCtrlMenu(f'step_{sid}', sid.upper(), f'step_{sid}', lp_text_id=f'edit_{sid}') for sid, _ in EMEET_REMOTE_STEPS] +
+                [BaseCtrlMenu(f'edit_{sid}', f'Edit {sid.upper()}', f'edit_{sid}', gui_hidden=True) for sid, _ in EMEET_REMOTE_STEPS],
+            child_tooltip = 'Click to zoom to the step, long press to type its zoom value',
+        ))
+        self.ctrls.append(BaseCtrl('emeet_remote_steps_info', 'Step values', 'info',
+            tooltip = 'Zoom value and approximate magnification of each step. The defaults were measured from the remote on 2026-10-15; long press a step to override one.',
+            value = self.steps_text(),
+        ))
+        self.ctrls.append(BaseCtrl('emeet_remote_actions', 'Lens, focus, reset', 'button',
+            tooltip = 'Switch: wide below 170 jumps to the tele lens, otherwise back to wide.\nFocus: toggles continuous autofocus.\nReset: same as Reset image.',
+            menu = [
+                BaseCtrlMenu('switch', 'Switch', 'switch'),
+                BaseCtrlMenu('focus', 'Focus', 'focus'),
+                BaseCtrlMenu('reset', 'Reset', 'reset'),
+            ],
+        ))
+        for text_id, name, v4l_id in [
+            ('brightness', 'Brightness', V4L2_CID_BRIGHTNESS),
+            ('sharpness', 'Sharpness', V4L2_CID_SHARPNESS),
+            ('color', 'Color', V4L2_CID_SATURATION),
+        ]:
+            if self.cam_ctrls.v4l_ctrls.find_by_v4l2_id(v4l_id) is not None:
+                self.ctrls.append(BaseCtrl(f'emeet_remote_{text_id}', name, 'button',
+                    tooltip = f'{name} down or up by {EMEET_REMOTE_LEVEL_STEP}',
+                    menu = [BaseCtrlMenu('down', '-', 'down'), BaseCtrlMenu('up', '+', 'up')],
+                ))
+
+        self.ctrls.append(BaseCtrl('emeet_remote_check', 'Check remote', 'button',
+            tooltip = 'Walk the remote button by button: press each one when asked and see which ones the camera and the picture react to',
+            menu = [BaseCtrlMenu('run', 'Start', 'run')],
+        ))
+        self.ctrls.append(BaseCtrl('emeet_remote_usb_reset', 'Reset camera (USB)', 'button',
+            tooltip = 'Last resort when exposure or the picture is stuck: resets the camera on the USB bus, it comes back in about a second and the active preset is applied again. Needs the 70-emeet-c60e.rules udev rule from the uvcvideo-emeet repo.',
+            menu = [BaseCtrlMenu('run', 'Reset', 'run')],
+        ))
+        self.ctrls.append(BaseCtrl('emeet_remote_check_info', 'Last remote check', 'info',
+            value = emcheck.last_result_text(get_configfilename(self.cam_ctrls.device)),
+        ))
+        self.ctrls.append(BaseCtrl('emeet_remote_note', 'Note', 'info',
+            value = 'Flip, Mirror and Effects live in the camera: press Reset on the remote to clear them.',
+        ))
+
+    def get_ctrls(self):
+        return self.ctrls
+
+    def related_ctrls(self, ctrl):
+        info = find_by_text_id(self.ctrls, 'emeet_remote_steps_info')
+        if info is not None and ctrl.text_id == 'emeet_remote_step':
+            info.value = self.steps_text()
+            return [info]
+        return []
+
+    def steps_text(self):
+        return ', '.join(
+            f'{sid.upper()} {zoom} ({emeet_zoom_factor(zoom):.1f}x{", set by you" if sid in self.custom else ""})'
+            for sid, zoom in self.steps.items()
+        )
+
+    def read_steps(self):
+        config = configparser.ConfigParser(interpolation=None)
+        try:
+            config.read(get_configfilename(self.cam_ctrls.device), encoding='utf-8')
+        except (configparser.Error, OSError) as e:
+            logging.warning(f'EmeetC60ERemoteCtrls: can\'t read the step values: {e}')
+            return
+        if EMEET_REMOTE_SECTION not in config:
+            return
+        for sid in self.steps:
+            raw = config[EMEET_REMOTE_SECTION].get(sid)
+            if raw is None:
+                continue
+            try:
+                zoom = int(raw)
+            except ValueError:
+                logging.warning(f'EmeetC60ERemoteCtrls: ignoring step {sid} = {raw!r}, not a number')
+                continue
+            if 0 <= zoom <= 400:
+                self.steps[sid] = zoom
+                self.custom.add(sid)
+            else:
+                logging.warning(f'EmeetC60ERemoteCtrls: ignoring step {sid} = {zoom}, out of range')
+
+    def set_step(self, sid, value, errs):
+        """Store zoom value for step sid (like 3x) in the device ini."""
+        sid = sid.lower()
+        if sid not in self.steps:
+            collect_warning(f'EmeetC60ERemoteCtrls: no step {sid}, use {list(self.steps)}', errs)
+            return
+        try:
+            zoom = int(value)
+        except (TypeError, ValueError):
+            collect_warning(f'EmeetC60ERemoteCtrls: {value!r} is not a number', errs)
+            return
+        if not 0 <= zoom <= 400:
+            collect_warning(f'EmeetC60ERemoteCtrls: {zoom} is out of range, use 0 to 400', errs)
+            return
+        try:
+            os.makedirs(get_configdir(), mode=0o755, exist_ok=True)
+            filename = get_configfilename(self.cam_ctrls.device)
+            config = configparser.ConfigParser(interpolation=None)
+            config.read(filename, encoding='utf-8')
+            if EMEET_REMOTE_SECTION not in config:
+                config[EMEET_REMOTE_SECTION] = {}
+            config[EMEET_REMOTE_SECTION][sid] = str(zoom)
+            with open(filename, 'w', encoding='utf-8') as configfile:
+                config.write(configfile)
+        except (OSError, configparser.Error) as e:
+            collect_warning(f'EmeetC60ERemoteCtrls: set_step failed: {e}', errs)
+            return
+        self.steps[sid] = zoom
+        self.custom.add(sid)
+        info = find_by_text_id(self.ctrls, 'emeet_remote_steps_info')
+        if info is not None:
+            info.value = self.steps_text()
+
+    def zoom_ctrl(self):
+        return self.cam_ctrls.v4l_ctrls.find_by_v4l2_id(V4L2_CID_ZOOM_ABSOLUTE)
+
+    def set_v4l(self, text_id, value, errs):
+        self.cam_ctrls.v4l_ctrls.setup_ctrls({text_id: value}, errs)
+
+    def move_zoom(self, value, errs):
+        zoom = self.zoom_ctrl()
+        if zoom is None or zoom.inactive or zoom.readonly:
+            collect_warning('EmeetC60ERemoteCtrls: zoom is not available', errs)
+            return
+        self.set_v4l(zoom.text_id, max(zoom.min, min(zoom.max, value)), errs)
+
+    def nudge(self, v4l_id, direction, errs):
+        c = self.cam_ctrls.v4l_ctrls.find_by_v4l2_id(v4l_id)
+        if c is None or c.inactive or c.readonly:
+            collect_warning(f'EmeetC60ERemoteCtrls: {v4l_id} is not available', errs)
+            return
+        self.set_v4l(c.text_id, max(c.min, min(c.max, c.value + direction * EMEET_REMOTE_LEVEL_STEP)), errs)
+
+    def setup_ctrls(self, params, errs):
+        for k, v in params.items():
+            ctrl = find_by_text_id(self.ctrls, k)
+            if ctrl is None:
+                continue
+            if find_by_text_id(ctrl.menu, v) is None:
+                collect_warning(f'EmeetC60ERemoteCtrls: Can\'t find {v} in {[c.text_id for c in ctrl.menu]}', errs)
+                continue
+            if k == 'emeet_remote_zoom':
+                zoom = self.zoom_ctrl()
+                if zoom is not None:
+                    delta = EMEET_REMOTE_ZOOM_STEP if v == 'zoom_in' else -EMEET_REMOTE_ZOOM_STEP
+                    self.move_zoom(zoom.value + delta, errs)
+            elif k == 'emeet_remote_step':
+                op, _, sid = v.partition('_')
+                if op == 'step':
+                    self.move_zoom(self.steps[sid], errs)
+            elif k == 'emeet_remote_actions':
+                self.run_action(v, errs)
+            elif k == 'emeet_remote_usb_reset':
+                ok, message = usb_reset(self.cam_ctrls.device)
+                if not ok:
+                    collect_warning(f'EmeetC60ERemoteCtrls: {message}', errs)
+            elif k == 'emeet_remote_check':
+                collect_warning('EmeetC60ERemoteCtrls: the remote check is interactive, run cameractrls.py --remote-check', errs)
+            elif k in self.level_ids:
+                self.nudge(self.level_ids[k], 1 if v == 'up' else -1, errs)
+
+    def run_action(self, action, errs):
+        if action == 'switch':
+            zoom = self.zoom_ctrl()
+            if zoom is not None:
+                self.move_zoom(EMEET_C60E_TELE_FROM if zoom.value < EMEET_C60E_TELE_FROM else 0, errs)
+        elif action == 'focus':
+            focus = self.cam_ctrls.v4l_ctrls.find_by_v4l2_id(V4L2_CID_FOCUS_AUTO)
+            if focus is None or focus.inactive or focus.readonly:
+                collect_warning('EmeetC60ERemoteCtrls: autofocus is not available', errs)
+            else:
+                self.set_v4l(focus.text_id, 0 if focus.value else 1, errs)
+        elif action == 'reset':
+            self.cam_ctrls.emeet_c60e.reset_image(errs)
+
+EMEET_CAPTURE_MODES = [
+    ('4k30', '4K 30', 'MJPG', '3840x2160', '30'),
+    ('1440p30', '1440p 30', 'MJPG', '2560x1440', '30'),
+    ('1080p60', '1080p 60', 'MJPG', '1920x1080', '60'),
+    ('1080p30', '1080p 30', 'MJPG', '1920x1080', '30'),
+    ('720p60', '720p 60', 'MJPG', '1280x720', '60'),
+]
+
+class EmeetC60ECaptureModes:
+    """One-click MJPG size and fps combinations, only the ones the device lists."""
+
+    def __init__(self, device, fd, cam_ctrls):
+        self.cam_ctrls = cam_ctrls
+        self.ctrls = []
+        if find_usb_ids_in_sysfs(device) != EMEET_C60E_USB_ID:
+            return
+        self.modes = [m for m in EMEET_CAPTURE_MODES if self.listed(m)]
+        if not self.modes:
+            return
+        self.ctrls = [
+            BaseCtrl('capture_mode', 'Capture mode', 'button',
+                tooltip = 'Set MJPG, the resolution and the fps in one go. Modes this camera does not list are hidden.',
+                menu = [BaseCtrlMenu(mid, name, mid) for mid, name, *_ in self.modes],
+                reopener = True,
+            ),
+            BaseCtrl('capture_mode_note', 'Note', 'info',
+                value = 'OBS sets its own format while it streams, use Lark\'s 4K switch for the stream.',
+            ),
+        ]
+
+    def listed(self, mode):
+        fmt = self.cam_ctrls.fmt_ctrls
+        _, _, pxf, res, fps = mode
+        if fmt.pxf_ctrl is None or pxf not in fmt.get_fmts():
+            return False
+        if res not in fmt.get_resolutions(str2pxf(pxf)):
+            return False
+        w, h = map(int, res.split('x'))
+        return any(abs(float(f) - float(fps)) < 0.05 for f in fmt.get_framerates(str2pxf(pxf), w, h))
+
+    def get_ctrls(self):
+        return self.ctrls
+
+    def setup_ctrls(self, params, errs):
+        for k, v in params.items():
+            ctrl = find_by_text_id(self.ctrls, k)
+            if ctrl is None or ctrl.type == 'info':
+                continue
+            mode = next((m for m in self.modes if m[0] == v), None)
+            if mode is None:
+                collect_warning(f'EmeetC60ECaptureModes: Can\'t find {v} in {[m[0] for m in self.modes]}', errs)
+                continue
+            _, _, pxf, res, fps = mode
+            self.cam_ctrls.fmt_ctrls.apply_format({'pixelformat': pxf, 'resolution': res, 'fps': fps}, errs)
+
 class AnkerWorkCtrl(BaseCtrl):
     def __init__(self, text_id, name, type, tooltip, selector, menu, length, min = None, max = None, default=None):
         super().__init__(text_id, name, type, tooltip=tooltip, menu=menu, min=min, max=max, default=default)
@@ -2105,6 +2720,16 @@ class V4L2Ctrl(BaseCtrl):
         self.last_set = 0
         self.repeat = None
 
+def format_exposure_time(_, v):
+    # V4L2 absolute exposure is in units of 100 us
+    us = v * 100
+    if us <= 0:
+        return f'{us:.0f} us'
+    return f'1/{round(1e6 / us)} s'
+
+def exposure_time_tooltip(v):
+    return f'{v * 100:.0f} us'
+
 class V4L2Ctrls:
     to_type = {
         V4L2_CTRL_TYPE_INTEGER: 'integer',
@@ -2118,6 +2743,7 @@ class V4L2Ctrls:
     def __init__(self, device, fd):
         self.device = device
         self.fd = fd
+        self.seen = {}
         self.get_device_controls()
 
 
@@ -2195,6 +2821,10 @@ class V4L2Ctrls:
                 text_id = self.to_text_id(qctrl.name)
                 text = qctrl.name.decode()
                 ctrl_type = V4L2Ctrls.to_type.get(qctrl.type)
+                if ctrl_type == 'integer' and qctrl.minimum == qctrl.maximum:
+                    logging.debug(f'V4L2Ctrls: {text_id} has min == max, hiding it')
+                    qctrl = v4l2_queryctrl(qctrl.id | next_flag)
+                    continue
                 if ctrl_type == 'integer' and qctrl.minimum == 0 and qctrl.maximum == 1 and qctrl.step == 1:
                     ctrl_type = 'boolean'
 
@@ -2230,7 +2860,8 @@ class V4L2Ctrls:
 
                 if qctrl.id == V4L2_CID_EXPOSURE_ABSOLUTE:
                     v4l2ctrl.scale_class = 'dark-to-light'
-                    v4l2ctrl.format_value = lambda s,v: f'{v:.0f}00 µs'
+                    v4l2ctrl.format_value = format_exposure_time
+                    v4l2ctrl.value_tooltip = exposure_time_tooltip
 
                 if qctrl.id in [V4L2_CID_GAIN, V4L2_CID_ANALOGUE_GAIN, V4L2_CID_DIGITAL_GAIN]:
                     v4l2ctrl.scale_class = 'dark-to-light'
@@ -2271,6 +2902,46 @@ class V4L2Ctrls:
     def get_ctrls(self):
         return self.ctrls
 
+    def read_back(self, ctrl):
+        raw = v4l2_control(ctrl.v4l2_id)
+        try:
+            ioctl(self.fd, VIDIOC_G_CTRL, raw)
+        except OSError as e:
+            logging.warning(f'V4L2Ctrls: can\'t read {ctrl.text_id} back: {e}')
+            return None
+        self.set_ctrl_int_value(ctrl, int(raw.value), [])
+        return ctrl.value
+
+    def raw_value(self, ctrl):
+        if ctrl.type != 'menu':
+            return ctrl.value
+        item = find_by_text_id(ctrl.menu, ctrl.value)
+        return item.value if item is not None else None
+
+    def note_seen(self, ctrl):
+        raw = self.raw_value(ctrl)
+        if raw is not None:
+            self.seen[ctrl.text_id] = raw
+
+    def read_changes(self):
+        changes = []
+        for ctrl in self.ctrls:
+            if ctrl.type == 'button' or ctrl.value is None:
+                continue
+            old = self.seen.setdefault(ctrl.text_id, self.raw_value(ctrl))
+            try:
+                raw = v4l2_control(ctrl.v4l2_id)
+                ioctl(self.fd, VIDIOC_G_CTRL, raw)
+            except OSError as e:
+                logging.warning(f'V4L2Ctrls: can\'t re-read {ctrl.text_id}: {e}')
+                continue
+            new = int(raw.value)
+            self.set_ctrl_int_value(ctrl, new, [])
+            self.seen[ctrl.text_id] = new
+            if new != old:
+                changes.append((ctrl, old, new))
+        return changes
+
     def to_text_id(self, text):
         return text.lower().translate(V4L2Ctrls.strtrans, delete = b',&(.)/').replace(b'__', b'_').decode()
 
@@ -2283,8 +2954,9 @@ class V4L2Ctrls:
 
 
 class V4L2Listener(Thread):
-    def __init__(self, ctrls, fmt_ctrls, cb, err_cb):
+    def __init__(self, ctrls, fmt_ctrls, cb, err_cb, lost_cb=None):
         super().__init__()
+        self.lost_cb = lost_cb
         self.fd = ctrls.fd
         self.ctrls = ctrls
         self.fmt_ctrls = fmt_ctrls
@@ -2335,7 +3007,9 @@ class V4L2Listener(Thread):
                     self.query_fmt_changes()
                 continue
             (fd , v) = p[0]
-            if v == select.POLLNVAL or v == select.POLLERR:
+            if v & (select.POLLNVAL | select.POLLERR | select.POLLHUP):
+                if self.lost_cb is not None and not self.epoll.closed:
+                    self.lost_cb()
                 break
             try:
                 ioctl(self.fd, VIDIOC_DQEVENT, event)
@@ -2436,6 +3110,44 @@ class V4L2FmtCtrls:
                 BaseCtrlMenu(fps, fps, None) for fps in framerates
             ]) # fps menu should be dropdown
             self.ctrls.append(self.fps_ctrl)
+
+    def apply_format(self, params, errs):
+        """Set pixelformat/resolution/fps from a preset in one go.
+
+        The combination is checked against what the device enumerates first, so a
+        format the camera can't do leaves it untouched and adds a single message."""
+        if self.pxf_ctrl is None:
+            return
+        pxf = params.get('pixelformat', self.pxf_ctrl.value)
+        res = params.get('resolution', self.res_ctrl.value if self.res_ctrl else None)
+        fps = params.get('fps', self.fps_ctrl.value if self.fps_ctrl else None)
+        wanted = ' '.join(str(x) for x in (pxf, res, f'{fps} fps' if fps else None) if x)
+
+        def supported():
+            if len(pxf) != 4 or pxf not in self.get_fmts():
+                return False
+            if res is None:
+                return True
+            if res not in self.get_resolutions(str2pxf(pxf)):
+                return False
+            if fps is None:
+                return True
+            w, h = map(int, res.split('x'))
+            return any(abs(float(f) - float(fps)) < 0.05 for f in self.get_framerates(str2pxf(pxf), w, h))
+
+        try:
+            ok = supported()
+        except ValueError:
+            ok = False
+        if not ok:
+            collect_warning(f'The preset\'s capture format ({wanted}) is not available on this camera, the format was left as it is.', errs)
+            return
+        if 'pixelformat' in params:
+            self.set_pixelformat(self.pxf_ctrl, pxf, errs)
+        if 'resolution' in params and self.res_ctrl:
+            self.set_resolution(self.res_ctrl, res, errs)
+        if 'fps' in params and self.fps_ctrl:
+            self.set_fps(self.fps_ctrl, fps, errs)
 
     def set_pixelformat(self, ctrl, pixelformat, errs):
         fmt = v4l2_format()
@@ -2728,7 +3440,83 @@ class ColorPreset:
 
             self.cam_ctrls.setup_ctrls({**self.defaults, **menu.presets}, errs)
 
+DAEMON_SERVICE = 'cameractrlsd.service'
+DAEMON_STATUS_STALE_S = 90
+
+def daemon_status_path():
+    return os.path.join(get_configdir(), 'cameractrlsd.status')
+
+def format_local_time(epoch):
+    return time.strftime('%b %d, %H:%M', time.localtime(epoch))
+
+def run_host_tool(args):
+    """stdout of a host tool, None when it can't run (missing, hung, failed to start)."""
+    try:
+        return subprocess.run(args, capture_output=True, timeout=5).stdout.decode().strip()
+    except (OSError, subprocess.SubprocessError) as e:
+        logging.warning(f'DaemonStatus: {args[0]} failed: {e}')
+        return None
+
+class DaemonStatus:
+    """Whether the restore daemon is up and when it last applied a preset.
+    With systemd on the host that is the unit state and the journal, inside a sandbox
+    without systemctl it is the status file the daemon keeps in the config dir."""
+
+    def __init__(self, cam_ctrls):
+        self.cam_ctrls = cam_ctrls
+        value = self.from_systemd() if os.path.exists('/bin/systemctl') else self.from_status_file()
+        self.ctrls = [] if value is None else [
+            BaseCtrl('cameractrlsd_status', 'Restore daemon', 'info',
+                tooltip = 'Whether cameractrlsd is running and when it last applied preset 1.\nIt restores preset 1 when the camera is plugged in.',
+                value = value,
+            )
+        ]
+
+    def get_ctrls(self):
+        return self.ctrls
+
+    def setup_ctrls(self, params, errs):
+        pass
+
+    def from_systemd(self):
+        state = run_host_tool(['systemctl', '--user', 'is-active', DAEMON_SERVICE])
+        if state is None:
+            return None
+        running = {'active': 'Running', 'activating': 'Starting', 'failed': 'Failed', 'inactive': 'Not running'}.get(state, state)
+        if state == 'inactive' and not os.path.exists(os.path.expanduser(f'~/.config/systemd/user/{DAEMON_SERVICE}')):
+            return 'Not set up'
+        line = run_host_tool(['journalctl', '--user', '-u', DAEMON_SERVICE, '-r', '-n', '1',
+            '-g', 'preset_device: /dev', '-o', 'short-iso', '--no-pager'])
+        applied = None
+        if line and not line.startswith('--'):
+            try:
+                applied = time.mktime(time.strptime(line.split()[0][:19], '%Y-%m-%dT%H:%M:%S'))
+            except (ValueError, IndexError):
+                logging.warning(f'DaemonStatus: can\'t read a time from the journal line: {line[:80]}')
+        return self.describe(running, applied)
+
+    def from_status_file(self):
+        try:
+            with open(daemon_status_path(), encoding='utf-8') as f:
+                status = json.load(f)
+            beat = float(status['heartbeat'])
+            applied = status.get('last_applied')
+        except FileNotFoundError:
+            return 'Not seen running'
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            logging.warning(f'DaemonStatus: can\'t read {daemon_status_path()}: {e}')
+            return None
+        running = 'Running' if time.time() - beat < DAEMON_STATUS_STALE_S else 'Not running'
+        return self.describe(running, None if applied is None else float(applied))
+
+    def describe(self, running, applied):
+        if applied is None:
+            return f'{running}, no preset applied yet'
+        return f'{running}, preset applied {format_local_time(applied)}'
+
 class SystemdSaver:
+    APP_ID = 'hu.irl.cameractrls'
+
     def __init__(self, cam_ctrls):
         self.systemd_user_dir = os.path.expanduser('~/.config/systemd/user')
         self.service_file = 'cameractrlsd.service'
@@ -2738,19 +3526,38 @@ class SystemdSaver:
             self.ctrls = []
             return
 
+        tooltip = 'Start cameractrlsd with Systemd to restore Preset 1 at device connection'
+        external = self.is_external_service()
+        if external:
+            tooltip = f'{self.service_file} already exists and is managed outside this app.\nIt is left as it is.'
         self.ctrls = [
             BaseCtrl('systemd_cameractrlsd', 'Start with Systemd', 'boolean',
-                tooltip = 'Start cameractrlsd with Systemd to restore Preset 1 at device connection',
+                tooltip = tooltip,
                 unrestorable = True,
-                value = self.is_service_active(),
+                value = True if external else self.is_service_active(),
+                readonly = external,
             )
         ]
 
     def systemd_available(self):
         return os.path.exists('/bin/systemctl')
 
+    def service_path(self):
+        return os.path.join(self.systemd_user_dir, self.service_file)
+
+    def is_external_service(self):
+        """True when a unit file exists that this app wouldn't have written."""
+        try:
+            with open(self.service_path(), encoding='utf-8') as f:
+                return f.read() != self.get_service_file()
+        except FileNotFoundError:
+            return False
+        except OSError as e:
+            logging.warning(f'SystemdSaver: can\'t read {self.service_path()}: {e}')
+            return True
+
     def is_service_active(self):
-        return os.path.exists(os.path.join(self.systemd_user_dir, self.service_file)) and \
+        return os.path.exists(self.service_path()) and \
             subprocess.run(["systemctl", "--user", "is-active", self.service_file], capture_output=True).returncode == 0
 
     def get_ctrls(self):
@@ -2761,6 +3568,10 @@ class SystemdSaver:
             ctrl = find_by_text_id(self.ctrls, k)
             if ctrl is None:
                 continue
+            if self.is_external_service():
+                collect_warning(f'SystemdSaver: {self.service_file} is managed outside this app, not touching it', errs)
+                ctrl.value = True
+                continue
             ctrl.value = to_bool(v)
             if ctrl.value:
                 self.create_systemd_service(ctrl, errs)
@@ -2768,11 +3579,11 @@ class SystemdSaver:
                 self.disable_systemd_service(errs)
 
     def create_systemd_service(self, ctrl, errs):
-        service_file_str = self.get_service_file(sys.path[0])
+        service_file_str = self.get_service_file()
 
         os.makedirs(self.systemd_user_dir, mode=0o755, exist_ok=True)
 
-        with open(os.path.join(self.systemd_user_dir, self.service_file), 'w', encoding="utf-8") as f:
+        with open(self.service_path(), 'w', encoding="utf-8") as f:
             f.write(service_file_str)
 
         pdr = subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
@@ -2795,31 +3606,49 @@ class SystemdSaver:
         if p.returncode:
             errs.extend(p.stderr.decode().splitlines())
 
+    def flatpak_app_id(self):
+        cp = configparser.ConfigParser(interpolation=None)
+        try:
+            cp.read('/.flatpak-info')
+            return cp.get('Application', 'name')
+        except (configparser.Error, OSError) as e:
+            logging.debug(f'SystemdSaver: no app id in /.flatpak-info: {e}')
+            return os.environ.get('FLATPAK_ID', self.APP_ID)
 
-    def get_service_file(self, script_path):
+    def get_exec_start(self):
+        if os.path.exists('/.flatpak-info'):
+            return f'/usr/bin/flatpak run --command=cameractrlsd.py {self.flatpak_app_id()}'
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cameractrlsd.py')
+
+    def get_service_file(self):
         return f"""[Unit]
 Description=CameraCtrls daemon - restore control values
 
 [Service]
 Type=simple
-ExecStart={script_path}/cameractrlsd.py
+ExecStart={self.get_exec_start()}
 
 [Install]
 WantedBy=graphical-session.target
 """
 
 class ConfigPreset:
+    NAMES_SECTION = 'preset_names'
+    PRESET_NUMS = ['1', '2', '3', '4']
+    MAX_NAME_LEN = 16
+
     def __init__(self, cam_ctrls):
         self.cam_ctrls = cam_ctrls
+        self.names = self.read_names()
         self.ctrls = [
             BaseCtrl('preset', 'Preset', 'button',
-                tooltip = 'Preset\nClick loads the preset\nLong press saves it',
-                child_tooltip = 'Click to load, long press to save',
+                tooltip = 'Preset\nClick loads the preset\nLong press saves it\nRight click renames it',
+                child_tooltip = 'Click to load, long press to save, right click to rename',
                 menu = [
-                    BaseCtrlMenu('load_1', '1', 'load_1', lp_text_id='save_1'),
-                    BaseCtrlMenu('load_2', '2', 'load_2', lp_text_id='save_2'),
-                    BaseCtrlMenu('load_3', '3', 'load_3', lp_text_id='save_3'),
-                    BaseCtrlMenu('load_4', '4', 'load_4', lp_text_id='save_4'),
+                    BaseCtrlMenu('load_1', self.names.get('1', '1'), 'load_1', lp_text_id='save_1'),
+                    BaseCtrlMenu('load_2', self.names.get('2', '2'), 'load_2', lp_text_id='save_2'),
+                    BaseCtrlMenu('load_3', self.names.get('3', '3'), 'load_3', lp_text_id='save_3'),
+                    BaseCtrlMenu('load_4', self.names.get('4', '4'), 'load_4', lp_text_id='save_4'),
                     #BaseCtrlMenu('load_5', '5', 'load_5', lp_text_id='save_5'),
                     #BaseCtrlMenu('load_6', '6', 'load_6', lp_text_id='save_6'),
                     #BaseCtrlMenu('load_7', '7', 'load_7', lp_text_id='save_7'),
@@ -2828,14 +3657,103 @@ class ConfigPreset:
                     BaseCtrlMenu('save_2', 'Save 2', 'save_2', gui_hidden=True),
                     BaseCtrlMenu('save_3', 'Save 3', 'save_3', gui_hidden=True),
                     BaseCtrlMenu('save_4', 'Save 4', 'save_4', gui_hidden=True),
+                    BaseCtrlMenu('save_1_fmt', 'Save 1 with format', 'save_1_fmt', gui_hidden=True),
+                    BaseCtrlMenu('save_2_fmt', 'Save 2 with format', 'save_2_fmt', gui_hidden=True),
+                    BaseCtrlMenu('save_3_fmt', 'Save 3 with format', 'save_3_fmt', gui_hidden=True),
+                    BaseCtrlMenu('save_4_fmt', 'Save 4 with format', 'save_4_fmt', gui_hidden=True),
                     #BaseCtrlMenu('save_5', 'Save 5', 'save_5', gui_hidden=True),
                     #BaseCtrlMenu('save_6', 'Save 6', 'save_6', gui_hidden=True),
                     #BaseCtrlMenu('save_7', 'Save 7', 'save_7', gui_hidden=True),
                     #BaseCtrlMenu('save_8', 'Save 8', 'save_8', gui_hidden=True),
                 ],
                 reopener = True,
-            )
+            ),
+            BaseCtrl('preset_include_format', 'Include capture format', 'boolean',
+                tooltip = 'Also store the pixel format, resolution and fps when saving a preset.\nOff by default, so loading a preset never fights an app that is using the camera.',
+                unrestorable = True,
+                value = False,
+                default = False,
+            ),
         ]
+        # the daemon turns this off, it must only restore the controls
+        self.restore_format = True
+
+    FORMAT_KEYS = ('pixelformat', 'resolution', 'fps')
+
+    def read_names(self):
+        """Optional labels for the preset buttons, from [preset_names] in the device ini."""
+        config = configparser.ConfigParser(interpolation=None)
+        try:
+            config.read(get_configfilename(self.cam_ctrls.device), encoding='utf-8')
+        except (configparser.Error, OSError) as e:
+            logging.warning(f'ConfigPreset: can\'t read preset names: {e}')
+            return {}
+        if self.NAMES_SECTION not in config:
+            return {}
+        return {n: config[self.NAMES_SECTION][n] for n in self.PRESET_NUMS if config[self.NAMES_SECTION].get(n)}
+
+    def names_text(self):
+        return ', '.join(f'{n}={name}' for n, name in self.names.items())
+
+    def rename_preset(self, preset_num, name, errs):
+        """Name a preset button, an empty name goes back to the number."""
+        if preset_num not in self.PRESET_NUMS:
+            collect_warning(f'ConfigPreset: no preset {preset_num}, use {self.PRESET_NUMS}', errs)
+            return
+        name = ' '.join(name.split())[:self.MAX_NAME_LEN]
+        try:
+            os.makedirs(get_configdir(), mode=0o755, exist_ok=True)
+            filename = get_configfilename(self.cam_ctrls.device)
+            config = configparser.ConfigParser(interpolation=None)
+            config.read(filename, encoding='utf-8')
+            if name:
+                if self.NAMES_SECTION not in config:
+                    config[self.NAMES_SECTION] = {}
+                config[self.NAMES_SECTION][preset_num] = name
+            elif config.has_section(self.NAMES_SECTION):
+                config.remove_option(self.NAMES_SECTION, preset_num)
+            with open(filename, 'w', encoding='utf-8') as configfile:
+                config.write(configfile)
+        except (OSError, configparser.Error) as e:
+            collect_warning(f'ConfigPreset: rename_preset failed: {e}', errs)
+            return
+        if name:
+            self.names[preset_num] = name
+        else:
+            self.names.pop(preset_num, None)
+        menu = find_by_text_id(find_by_text_id(self.ctrls, 'preset').menu, f'load_{preset_num}')
+        menu.name = name or preset_num
+
+    def active_preset(self):
+        """The first named preset the camera matches, else 1."""
+        for num, _ in self.named_presets():
+            if self.preset_matches(num):
+                return num
+        return '1'
+
+    def preset_values(self, preset_num):
+        config = configparser.ConfigParser(interpolation=None)
+        config.read(get_configfilename(self.cam_ctrls.device), encoding='utf-8')
+        return dict(config[f'preset_{preset_num}']) if config.has_section(f'preset_{preset_num}') else {}
+
+    def named_presets(self):
+        """(number, name) of the presets that have a name, in number order."""
+        return [(n, self.names[n]) for n in self.PRESET_NUMS if n in self.names]
+
+    def preset_matches(self, preset_num):
+        """True when every stored control that is live on this device already has the preset's value."""
+        config = configparser.ConfigParser()
+        try:
+            config.read(get_configfilename(self.cam_ctrls.device))
+        except (configparser.Error, OSError) as e:
+            logging.warning(f'ConfigPreset: can\'t read preset {preset_num}: {e}')
+            return False
+        section = f'preset_{preset_num}'
+        if section not in config:
+            return False
+        current = self.get_claimed_controls(include_format=True)
+        compared = [k for k in config[section] if k in current]
+        return bool(compared) and all(str(current[k]) == config[section][k] for k in compared)
 
     def get_ctrls(self):
         return self.ctrls
@@ -2845,21 +3763,26 @@ class ConfigPreset:
             ctrl = find_by_text_id(self.ctrls, k)
             if ctrl is None:
                 continue
+            if ctrl.text_id == 'preset_include_format':
+                ctrl.value = to_bool(v)
+                continue
             menu = find_by_text_id(ctrl.menu, v)
             if menu is None:
                 collect_warning(f'ConfigPreset: Can\'t find {v} in {[c.text_id for c in ctrl.menu]}', errs)
                 continue
-            [op, preset_num] = menu.text_id.split('_')
+            [op, preset_num, *with_fmt] = menu.text_id.split('_')
             if op == 'load':
                 self.load_preset(self.cam_ctrls.device, preset_num, errs)
             elif op == 'save':
-                self.save_preset(self.cam_ctrls.device, preset_num, errs)
+                include_format = bool(with_fmt) or find_by_text_id(self.ctrls, 'preset_include_format').value
+                self.save_preset(self.cam_ctrls.device, preset_num, errs, include_format)
 
-    def get_claimed_controls(self):
+    def get_claimed_controls(self, include_format = False):
         return {
             c.text_id: c.value
             for c in self.cam_ctrls.get_ctrls()
             if not c.inactive and not c.readonly and c.value is not None and c.type != 'info' and not c.unrestorable
+                and (include_format or c.text_id not in self.FORMAT_KEYS)
         }
 
     def load_preset(self, device, preset_num, errs):
@@ -2875,10 +3798,25 @@ class ConfigPreset:
             collect_warning(f'ConfigPreset: {preset} not found in {filename}', errs)
             return
         
-        for ctrl in config[preset]:
-            self.cam_ctrls.setup_ctrls({ctrl: config[preset][ctrl]}, errs)
+        fmt = {k: v for k, v in config[preset].items() if k in self.FORMAT_KEYS}
+        if fmt and self.restore_format:
+            self.cam_ctrls.fmt_ctrls.apply_format(fmt, errs)
+        known = {c.text_id for c in self.cam_ctrls.get_ctrls()}
+        skipped = [k for k in config[preset] if k not in known]
+        if skipped:
+            # presets from other builds can carry controls this device doesn't have or this fork hides
+            logging.debug(f'ConfigPreset: {preset}: skipping controls not on this device: {skipped}')
+        auto_first = ('auto_exposure', 'white_balance_automatic', 'focus_automatic_continuous')
+        with self.cam_ctrls.hold_stream():
+            for ctrl in sorted(config[preset], key=lambda k: k not in auto_first):
+                if ctrl in self.FORMAT_KEYS or ctrl not in known:
+                    continue
+                if ctrl == 'auto_exposure' and find_usb_ids_in_sysfs(device) == EMEET_C60E_USB_ID:
+                    self.cam_ctrls.reassert_exposure(config[preset][ctrl], {}, [])
+                    continue
+                self.cam_ctrls.setup_ctrls({ctrl: config[preset][ctrl]}, errs)
 
-    def save_preset(self, device, preset_num, errs):
+    def save_preset(self, device, preset_num, errs, include_format = False):
         try:
             configdir = get_configdir()
             os.makedirs(configdir, mode=0o755, exist_ok=True)
@@ -2886,7 +3824,7 @@ class ConfigPreset:
             filename = get_configfilename(device)
             config = configparser.ConfigParser()
             config.read(filename)
-            config[f'preset_{preset_num}'] = self.get_claimed_controls()
+            config[f'preset_{preset_num}'] = self.get_claimed_controls(include_format)
             with open(filename, 'w') as configfile:
                 config.write(configfile)
         except Exception as e:
@@ -3122,6 +4060,10 @@ class CameraCtrls:
         self.fd = fd
         self.v4l_ctrls = V4L2Ctrls(device, fd)
         self.fmt_ctrls = V4L2FmtCtrls(device, fd)
+        self.config_preset = ConfigPreset(self)
+        self.emeet_c60e = EmeetC60ECtrls(device, fd, self)
+        self.emeet_remote = EmeetC60ERemoteCtrls(device, fd, self)
+        self.emeet_modes = EmeetC60ECaptureModes(device, fd, self)
         self.ctrls = [
             self.v4l_ctrls,
             self.fmt_ctrls,
@@ -3129,11 +4071,26 @@ class CameraCtrls:
             LogitechCtrls(device, fd),
             DellUltraSharpCtrls(device, fd),
             AnkerWorkCtrls(device, fd),
+            self.emeet_c60e,
+            self.emeet_remote,
+            self.emeet_modes,
+            DaemonStatus(self),
             SystemdSaver(self),
             ColorPreset(self),
-            ConfigPreset(self),
+            self.config_preset,
             DesktopPortal(self),
         ]
+
+    def capture_format(self):
+        """The current pixelformat/width/height/fps as the preview and the remote check need them, or None."""
+        f = self.fmt_ctrls
+        if f.pxf_ctrl is None or f.res_ctrl is None or f.fps_ctrl is None:
+            return None
+        try:
+            w, h = f.res_ctrl.value.split('x')
+            return {'pixelformat': f.pxf_ctrl.value, 'width': int(w), 'height': int(h), 'fps': float(f.fps_ctrl.value)}
+        except ValueError:
+            return None
 
     def has_ptz(self):
         return any([
@@ -3145,10 +4102,15 @@ class CameraCtrls:
         ])
 
     def print_ctrls(self):
+        notes_printed = set()
         for page in self.get_ctrl_pages():
             for cat in page.categories:
                 print(f'{page.title} / {cat.title}')
                 for c in cat.ctrls:
+                    if c.text_id.endswith('_note'):
+                        if c.value in notes_printed:
+                            continue
+                        notes_printed.add(c.value)
                     print(f' {c.text_id}', end = '')
                     if c.type == 'menu':
                         print(f' = {c.value}\t( ', end = '')
@@ -3159,8 +4121,13 @@ class CameraCtrls:
                     elif c.type == 'button':
                         print('\t\t( buttons: ', end = '')
                         print(', '.join([m.text_id for m in c.menu]), end = ' )')
+                        if c.text_id == 'preset' and self.config_preset.names:
+                            print(f' | names: {self.config_preset.names_text()}', end = '')
                     elif c.type == 'info':
                         print(f' = {c.value}', end = '')
+                    elif c.type == 'color':
+                        print(f' = {c.value}\t( default: {c.default} values: ', end = '')
+                        print(', '.join([m.text_id for m in c.menu]) + ', rrggbb', end = ' )')
                     elif c.type in ['integer', 'boolean']:
                         print(f' = {c.value}\t( default: {c.default} min: {c.min} max: {c.max}', end = '')
                         if c.step and c.step != 1:
@@ -3188,6 +4155,10 @@ class CameraCtrls:
 
     def get_ctrl_by_text_id(self, text_id):
         return find_by_text_id(self.get_ctrls(), text_id)
+
+    def related_ctrls(self, ctrl):
+        """Controls whose displayed value depends on ctrl (see EmeetC60ECtrls)."""
+        return self.emeet_c60e.related_ctrls(ctrl) + self.emeet_remote.related_ctrls(ctrl)
 
     def get_ctrl_pages(self):
         ctrls = self.get_ctrls()
@@ -3234,6 +4205,9 @@ class CameraCtrls:
                     ]) +
                     pop_list_by_text_ids(ctrls, ['kiyo_pro_af_mode', 'logitech_motor_focus', 'ankerwork_face_focus'])
                 ),
+                CtrlCategory('Light', pop_list_by_text_ids(ctrls, ['emeet_c60e_light'])),
+                CtrlCategory('EMEET C60E', pop_list_by_text_ids(ctrls, ['emeet_c60e_reset', 'emeet_c60e_zoom', 'emeet_c60e_lens'])),
+                CtrlCategory('Remote', pop_list_by_text_ids(ctrls, ['emeet_remote_'])),
             ]),
             CtrlPage('Exposure', [
                 CtrlCategory('Exposure', pop_list_by_ids(ctrls, [
@@ -3304,15 +4278,15 @@ class CameraCtrls:
                 CtrlCategory('Rotate/Flip', pop_list_by_ids(ctrls, [V4L2_CID_ROTATE, V4L2_CID_HFLIP, V4L2_CID_VFLIP])),
                 CtrlCategory('Image Source Control', pop_list_by_base_id(ctrls, V4L2_CID_IMAGE_SOURCE_CLASS_BASE)),
                 CtrlCategory('Image Process Control', pop_list_by_base_id(ctrls, V4L2_CID_IMAGE_PROC_CLASS_BASE)),
-                CtrlCategory('Cameractrlsd', pop_list_by_text_ids(ctrls, ['systemd_cameractrlsd', 'desktop_portal_cameractrlsd'])),
+                CtrlCategory('Cameractrlsd', pop_list_by_text_ids(ctrls, ['cameractrlsd_status', 'systemd_cameractrlsd', 'desktop_portal_cameractrlsd'])),
             ]),
             CtrlPage('Compression', [
                 CtrlCategory('Codec', pop_list_by_base_id(ctrls, V4L2_CID_CODEC_BASE)),
                 CtrlCategory('JPEG', pop_list_by_base_id(ctrls, V4L2_CID_JPEG_CLASS_BASE)),
             ]),
             CtrlPage('Capture', [
-                CtrlCategory('Capture', pop_list_by_text_ids(ctrls, ['pixelformat', 'resolution', 'fps'])),
-                CtrlCategory('Info', pop_list_by_text_ids(ctrls, ['card', 'driver', 'path', 'real_path'])),
+                CtrlCategory('Capture', pop_list_by_text_ids(ctrls, ['capture_mode', 'pixelformat', 'resolution', 'fps'])),
+                CtrlCategory('Info', pop_list_by_text_ids(ctrls, ['emeet_c60e_serial', 'emeet_c60e_firmware', 'emeet_c60e_info_note', 'card', 'driver', 'path', 'real_path'])),
             ]),
             CtrlPage('Settings', [
                 CtrlCategory('Save', pop_list_by_text_ids(ctrls, ['kiyo_pro_save', 'preset'])),
@@ -3327,11 +4301,101 @@ class CameraCtrls:
 
         return pages
 
-    def subscribe_events(self, cb, err_cb):
-        thread = V4L2Listener(self.v4l_ctrls, self.fmt_ctrls, cb, err_cb)
+    def hold_stream(self):
+        if find_usb_ids_in_sysfs(self.device) != EMEET_C60E_USB_ID:
+            return contextlib.nullcontext()
+        return ShortStream(self.device)
+
+    def reassert_exposure(self, mode, values, errs, sleep=time.sleep):
+        """Hand exposure back from the camera's own state: aperture priority, a pause, then `mode` (and `values` when
+        it is manual), read back and rewritten up to 3 more times."""
+        mode_ctrl = find_by_text_id(self.v4l_ctrls.ctrls, 'auto_exposure')
+        if mode_ctrl is None:
+            return True
+        scratch = []
+
+        def write(want):
+            self.setup_ctrls({'auto_exposure': want}, scratch)
+            if want != 'aperture_priority_mode':
+                for k, v in values.items():
+                    self.setup_ctrls({k: v}, scratch)
+
+        with self.hold_stream():
+            self.setup_ctrls({'auto_exposure': 'aperture_priority_mode'}, scratch)
+            sleep(0.3)
+            ok = write_verified(write, lambda: self.v4l_ctrls.read_back(mode_ctrl), mode, 3, 0.2, sleep)
+        if ok:
+            return True
+        msg = f'CameraCtrls: auto_exposure would not stay at {mode}'
+        logging.info(msg)
+        errs.append(msg)
+        return False
+
+    def subscribe_remote(self, on_push):
+        if find_usb_ids_in_sysfs(self.device) != EMEET_C60E_USB_ID:
+            return None
+        watcher = RemoteWatcher(on_push)
+        watcher.start()
+        return watcher
+
+    def subscribe_events(self, cb, err_cb, lost_cb=None):
+        thread = V4L2Listener(self.v4l_ctrls, self.fmt_ctrls, cb, err_cb, lost_cb)
         thread.start()
         return thread
 
+
+def watch_remote_pushes():
+    try:
+        fd = open_hid_readonly()
+    except EmeetHidError as e:
+        print(e)
+        return 2
+    stop = Event()
+    print('Watching for remote presses, Ctrl+C to stop.', flush=True)
+    try:
+        read_pushes(fd, lambda: print(f'{time.strftime("%H:%M:%S")} remote push', flush=True), stop)
+    except KeyboardInterrupt:
+        pass
+    except OSError as e:
+        print(f'HID read failed: {e.strerror}')
+        return 2
+    finally:
+        os.close(fd)
+    return 0
+
+def remote_check(camera_ctrls, device, wait):
+    fmt = camera_ctrls.capture_format()
+    if fmt is None:
+        print('Can\'t read the capture format of this camera.')
+        return 2
+    try:
+        grabber = emcheck.make_grabber(device, fmt)
+    except Exception as e:
+        print(f'Can\'t read the picture: {e}')
+        return 2
+    heard = emcheck.HeardCounter()
+    watcher = camera_ctrls.subscribe_remote(heard.push)
+    def say(i, total, name, phase):
+        if phase == 'press':
+            print(f'[{i + 1}/{total}] Press {name} on the remote now ({wait:g} s)...', flush=True)
+    print('Point the remote at the camera. The picture is read after each press.', flush=True)
+    try:
+        results = emcheck.run_check(grabber.grab, say, heard, wait=wait)
+    except (emcheck.GrabError, ValueError) as e:
+        print(f'Remote check stopped: {e}')
+        return 2
+    finally:
+        grabber.close()
+        if watcher is not None:
+            watcher.stop()
+    print()
+    print(emcheck.format_table(results))
+    try:
+        emcheck.save_result(get_configfilename(device), results)
+    except (OSError, configparser.Error) as e:
+        print(f'Could not save the result: {e}')
+        return 2
+    return 0
 
 def usage():
     print(f'usage: {sys.argv[0]} [--help] [-d DEVICE] [--list] [-c CONTROLS]\n')
@@ -3341,13 +4405,18 @@ def usage():
     print(f'  -l, --list         list the controls and values')
     print(f'  -L, --list-devices list capture devices')
     print(f'  -c CONTROLS        set CONTROLS (eg.: hdr=on,fov=wide)')
+    print(f'  --name-preset N=NAME  label preset button N (1-4), empty NAME clears it')
+    print(f'  --watch-remote     print a line for every remote press the camera reports, until Ctrl+C')
+    print(f'  --remote-check     press each remote button when asked and report what the camera and the picture did')
+    print(f'  --check-wait SEC   seconds to wait after each cue in --remote-check (default 3)')
+    print(f'  --set-step STEP=ZOOM  set the zoom value of remote step STEP (1x, 3x, 5x, 7x, 11x), 0 to 400')
     print()
     print(f'example:')
     print(f'  {sys.argv[0]} -c brightness=128,kiyo_pro_hdr=on,kiyo_pro_fov=wide')
 
 def main():
     try:
-        arguments, values = getopt.getopt(sys.argv[1:], 'hd:lLc:', ['help', 'list', 'list-devices'])
+        arguments, values = getopt.getopt(sys.argv[1:], 'hd:lLc:', ['help', 'list', 'list-devices', 'name-preset=', 'set-step=', 'watch-remote', 'remote-check', 'check-wait='])
     except getopt.error as err:
         print(err)
         usage()
@@ -3359,6 +4428,11 @@ def main():
 
     list_controls = False
     list_devices = False
+    preset_names = []
+    set_steps = []
+    watch_remote = False
+    check_remote = False
+    check_wait = 3.0
     device = '/dev/video0'
     controls = ''
 
@@ -3372,6 +4446,22 @@ def main():
             list_controls = True
         elif current_argument in ('-L', '--list-devices'):
             list_devices = True
+        elif current_argument == '--name-preset':
+            preset_names.append(current_value)
+        elif current_argument == '--watch-remote':
+            watch_remote = True
+        elif current_argument == '--remote-check':
+            check_remote = True
+        elif current_argument == '--check-wait':
+            try:
+                check_wait = float(current_value)
+            except ValueError:
+                check_wait = -1
+            if not 0 <= check_wait <= 60:
+                print('--check-wait takes 0 to 60 seconds')
+                sys.exit(2)
+        elif current_argument == '--set-step':
+            set_steps.append(current_value)
         elif current_argument in ('-c'):
             controls = current_value
 
@@ -3388,8 +4478,28 @@ def main():
 
     camera_ctrls = CameraCtrls(device, fd)
 
+    for pn in preset_names:
+        num, _, name = pn.partition('=')
+        errs = []
+        camera_ctrls.config_preset.rename_preset(num, name, errs)
+        if errs:
+            sys.exit(2)
+
+    for step in set_steps:
+        errs = []
+        sid, _, zoom = step.partition('=')
+        camera_ctrls.emeet_remote.set_step(sid, zoom, errs)
+        if errs:
+            sys.exit(2)
+
     if list_controls:
         camera_ctrls.print_ctrls()
+
+    if watch_remote:
+        sys.exit(watch_remote_pushes())
+
+    if check_remote:
+        sys.exit(remote_check(camera_ctrls, device, check_wait))
 
     if controls != '':
         ctrlsmap = {}
