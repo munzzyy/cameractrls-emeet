@@ -1,0 +1,29 @@
+app-id: hu.irl.cameractrls
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+command: cameractrlsgtk4.py
+finish-args:
+  - --device=all
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+modules:
+  - name: cameractrls
+    buildsystem: simple
+    build-commands:
+      - install -D -t /app/bin *.py
+      - install -D -t /app/share/metainfo pkg/hu.irl.cameractrls.metainfo.xml
+      - install -D -t /app/share/icons/hicolor/scalable/apps pkg/hu.irl.cameractrls.svg
+      - sed 's/^Exec=.*/Exec=cameractrlsgtk4.py/' pkg/hu.irl.cameractrls.desktop > hu.irl.cameractrls.desktop
+      - install -D -t /app/share/applications hu.irl.cameractrls.desktop
+    post-install:
+      - python3 -m compileall /app/bin
+    sources:
+      - type: dir
+        path: ..
+        skip:
+          - .git
+          - flatpak
+          - tools
+          - screenshots

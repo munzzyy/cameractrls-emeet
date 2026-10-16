@@ -1,2 +1,4 @@
 __pycache__
 rust
+flatpak/build-dir/
+flatpak/.flatpak-builder/
