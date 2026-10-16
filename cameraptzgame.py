@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 
 import sys, os, ctypes, ctypes.util, logging, getopt, signal, atexit, time
-from cameractrls import CameraCtrls, PTZController
+from cameractrls import CameraCtrls, PTZController, find_usb_ids_in_sysfs, get_configfilename
+import cameraptzc60e
 
 sdl2lib = ctypes.util.find_library('SDL2-2.0')
 if sdl2lib is None:
@@ -84,6 +85,11 @@ SDL_GameControllerGetButton.restype = ctypes.c_int8
 SDL_GameControllerGetButton.argtypes = [ctypes.c_void_p, SDL_GameControllerButton]
 # Uint8 SDL_GameControllerGetButton(SDL_GameController *gamecontroller, SDL_GameControllerButton button);
 
+SDL_GameControllerGetAttached = sdl2.SDL_GameControllerGetAttached
+SDL_GameControllerGetAttached.restype = ctypes.c_bool
+SDL_GameControllerGetAttached.argtypes = [ctypes.c_void_p]
+# SDL_bool SDL_GameControllerGetAttached(SDL_GameController *gamecontroller);
+
 SDL_GameControllerClose = sdl2.SDL_GameControllerClose
 SDL_GameControllerClose.argtypes = [ctypes.c_void_p]
 # void SDL_GameControllerClose(SDL_GameController *gamecontroller);
@@ -101,6 +107,7 @@ SDL_INIT_EVENTS = 0x00004000
 
 SDL_QUIT = 0x100
 SDL_CONTROLLERDEVICEADDED = 0x653
+SDL_CONTROLLERDEVICEREMOVED = 0x654
 
 _event_pad_size = 56 if ctypes.sizeof(ctypes.c_void_p) <= 8 else 64
 
@@ -127,10 +134,11 @@ SDL_PushEvent.argtypes = [ctypes.POINTER(SDL_Event)]
 #int SDL_PushEvent(SDL_Event * event);
 
 def usage():
-    print(f'usage: {sys.argv[0]} [-h] [-l] [-c] [-d DEVICE]\n')
+    print(f'usage: {sys.argv[0]} [-h] [-l] [-m] [-c] [-d DEVICE]\n')
     print(f'optional arguments:')
     print(f'  -h, --help        show this help message and exit')
     print(f'  -l, --list        list gamecontrollers')
+    print(f'  -m, --map         print the EMEET C60E button map for DEVICE and exit')
     print(f'  -c, --controller  use controller id (0..n), default first')
     print(f'  -d DEVICE         use DEVICE, default /dev/video0')
     print()
@@ -177,15 +185,48 @@ def check_button(controller, button, cb, rumble=rumble_simple):
     if cb([]):
         rumble(controller)
 
+PAD_BUTTONS = {
+    'a': SDL_CONTROLLER_BUTTON_A, 'b': SDL_CONTROLLER_BUTTON_B,
+    'x': SDL_CONTROLLER_BUTTON_X, 'y': SDL_CONTROLLER_BUTTON_Y,
+    'back': SDL_CONTROLLER_BUTTON_BACK, 'guide': SDL_CONTROLLER_BUTTON_GUIDE,
+    'start': SDL_CONTROLLER_BUTTON_START,
+    'leftstick': SDL_CONTROLLER_BUTTON_LEFTSTICK, 'rightstick': SDL_CONTROLLER_BUTTON_RIGHTSTICK,
+    'leftshoulder': SDL_CONTROLLER_BUTTON_LEFTSHOULDER, 'rightshoulder': SDL_CONTROLLER_BUTTON_RIGHTSHOULDER,
+    'dpup': SDL_CONTROLLER_BUTTON_DPAD_UP, 'dpdown': SDL_CONTROLLER_BUTTON_DPAD_DOWN,
+    'dpleft': SDL_CONTROLLER_BUTTON_DPAD_LEFT, 'dpright': SDL_CONTROLLER_BUTTON_DPAD_RIGHT,
+}
+
+PAD_AXES = {
+    'leftx': SDL_CONTROLLER_AXIS_LEFTX, 'lefty': SDL_CONTROLLER_AXIS_LEFTY,
+    'rightx': SDL_CONTROLLER_AXIS_RIGHTX, 'righty': SDL_CONTROLLER_AXIS_RIGHTY,
+    'lefttrigger': SDL_CONTROLLER_AXIS_TRIGGERLEFT, 'righttrigger': SDL_CONTROLLER_AXIS_TRIGGERRIGHT,
+}
+
+def read_pad_state(controller):
+    buttons = {n for n, b in PAD_BUTTONS.items() if SDL_GameControllerGetButton(controller, b)}
+    axes = {n: SDL_GameControllerGetAxis(controller, a) for n, a in PAD_AXES.items()}
+    return buttons, axes
+
+stop_requested = False
+
+def request_stop(signum, frame):
+    global stop_requested
+    stop_requested = True
+    SDL_PushEvent(SDL_QuitEvent)
+
+def say(msg):
+    print(msg, flush=True)
+
 def main():
     try:
-        arguments, values = getopt.getopt(sys.argv[1:], 'hlc:d:', ['help', 'list', 'controller', 'device'])
+        arguments, values = getopt.getopt(sys.argv[1:], 'hlmc:d:', ['help', 'list', 'map', 'controller', 'device'])
     except getopt.error as err:
         print(err)
         usage()
         sys.exit(2)
 
     list_ctrls = False
+    show_map = False
     controller_id = None
     device = '/dev/video0'
 
@@ -200,16 +241,25 @@ def main():
             sys.exit(0)
         elif current_argument in ('-l', '--list'):
             list_ctrls = True
+        elif current_argument in ('-m', '--map'):
+            show_map = True
         elif current_argument in ('-c', '--controller'):
             controller_id = int(current_value.split(':')[-1])
         elif current_argument in ('-d', '--device'):
             device = current_value
 
+    if show_map:
+        profile = cameraptzc60e.load_profile(cameraptzc60e.read_ini(get_configfilename(device)))
+        print(cameraptzc60e.format_map(*profile))
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
+
     if SDL_Init(SDL_INIT_GAMECONTROLLER | SDL_INIT_EVENTS) != 0:
         logging.error(f'SDL_Init failed: {SDL_GetError()}')
         sys.exit(1)
 
-    signal.signal(signal.SIGINT, lambda signum, frame: SDL_PushEvent(SDL_QuitEvent))
     atexit.register(SDL_Quit)
 
     for i in range(SDL_NumJoysticks()):
@@ -244,58 +294,89 @@ def main():
 
     ptz = PTZController(camera_ctrls)
 
-    running = True
-    event = SDL_Event()
-    while running:
-        while SDL_PollEvent(ctypes.byref(event)):
-            if event.type == SDL_QUIT:
-                running = False
-            if event.type == SDL_CONTROLLERDEVICEADDED:
-                if controller_id is None:
-                    controller_id = event.cdevice.which
-                if event.cdevice.which == controller_id:
-                    if controller is not None:
-                        SDL_GameControllerClose(controller)
-                        controller = None
-                    controller = SDL_GameControllerOpen(controller_id)
-                    if controller is None:
-                        logging.error(f'SDL_GameControllerOpen failed: {SDL_GetError()}')
-                        sys.exit(1)
+    pad = None
+    viewer = None
+    listener = None
+    if find_usb_ids_in_sysfs(device) == cameraptzc60e.C60E_USB_ID:
+        config = cameraptzc60e.read_ini(get_configfilename(device))
+        viewer = cameraptzc60e.ViewerLauncher(device)
+        pad = cameraptzc60e.C60EPad(
+            camera_ctrls, config,
+            lambda num, errs: camera_ctrls.config_preset.load_preset(device, num, errs),
+            viewer.spawn, viewer.toggle_hint, say)
+        say('EMEET C60E pad map:')
+        say(cameraptzc60e.format_map(pad.bindings, pad.settings, pad.steps))
+        listener = camera_ctrls.subscribe_events(lambda c: None, lambda errs: say(f'warning: {errs}'))
 
-                    SDL_GameControllerRumble(controller, 0x00ff, 0xffff, 250)
+    try:
+        running = True
+        event = SDL_Event()
+        while running and not stop_requested:
+            while SDL_PollEvent(ctypes.byref(event)):
+                if event.type == SDL_QUIT:
+                    running = False
+                if event.type == SDL_CONTROLLERDEVICEREMOVED and controller is not None and not SDL_GameControllerGetAttached(controller):
+                    say('pad unplugged, exiting')
+                    running = False
+                if event.type == SDL_CONTROLLERDEVICEADDED:
+                    if controller_id is None:
+                        controller_id = event.cdevice.which
+                    if event.cdevice.which == controller_id:
+                        if controller is not None:
+                            SDL_GameControllerClose(controller)
+                            controller = None
+                        controller = SDL_GameControllerOpen(controller_id)
+                        if controller is None:
+                            logging.error(f'SDL_GameControllerOpen failed: {SDL_GetError()}')
+                            sys.exit(1)
 
-        if ptz.has_pantilt_speed:
-            check_axis(controller, SDL_CONTROLLER_AXIS_LEFTX, ptz.do_pan_speed)
-            check_axis(controller, SDL_CONTROLLER_AXIS_LEFTY, ptz.do_tilt_speed, -1)
-        elif ptz.has_pantilt_absolute:
-            check_axis(controller, SDL_CONTROLLER_AXIS_LEFTX, ptz.do_pan_step)
-            check_axis(controller, SDL_CONTROLLER_AXIS_LEFTY, ptz.do_tilt_step, -1)
+                        SDL_GameControllerRumble(controller, 0x00ff, 0xffff, 250)
 
-        check_axis_abs(controller, SDL_CONTROLLER_AXIS_RIGHTX, ptz.do_pan_step)
-        check_axis_abs(controller, SDL_CONTROLLER_AXIS_RIGHTY, ptz.do_tilt_step, -1)
+            if pad is not None:
+                if controller is not None and running:
+                    buttons, axes = read_pad_state(controller)
+                    pad.update(time.monotonic(), buttons, axes)
+                time.sleep(0.020)
+                continue
 
-        check_zoom(controller, SDL_CONTROLLER_AXIS_TRIGGERLEFT, ptz.do_zoom_step, -1)
-        check_zoom(controller, SDL_CONTROLLER_AXIS_TRIGGERRIGHT, ptz.do_zoom_step)
+            if ptz.has_pantilt_speed:
+                check_axis(controller, SDL_CONTROLLER_AXIS_LEFTX, ptz.do_pan_speed)
+                check_axis(controller, SDL_CONTROLLER_AXIS_LEFTY, ptz.do_tilt_speed, -1)
+            elif ptz.has_pantilt_absolute:
+                check_axis(controller, SDL_CONTROLLER_AXIS_LEFTX, ptz.do_pan_step)
+                check_axis(controller, SDL_CONTROLLER_AXIS_LEFTY, ptz.do_tilt_step, -1)
 
-        check_button_v(controller, SDL_CONTROLLER_BUTTON_DPAD_LEFT, ptz.do_pan_step, -1)
-        check_button_v(controller, SDL_CONTROLLER_BUTTON_DPAD_RIGHT, ptz.do_pan_step)
-        check_button_v(controller, SDL_CONTROLLER_BUTTON_DPAD_UP, ptz.do_tilt_step)
-        check_button_v(controller, SDL_CONTROLLER_BUTTON_DPAD_DOWN, ptz.do_tilt_step, -1)
+            check_axis_abs(controller, SDL_CONTROLLER_AXIS_RIGHTX, ptz.do_pan_step)
+            check_axis_abs(controller, SDL_CONTROLLER_AXIS_RIGHTY, ptz.do_tilt_step, -1)
 
-        check_button(controller, SDL_CONTROLLER_BUTTON_GUIDE, ptz.do_reset)
+            check_zoom(controller, SDL_CONTROLLER_AXIS_TRIGGERLEFT, ptz.do_zoom_step, -1)
+            check_zoom(controller, SDL_CONTROLLER_AXIS_TRIGGERRIGHT, ptz.do_zoom_step)
 
-        check_button_v(controller, SDL_CONTROLLER_BUTTON_A, ptz.do_preset, 1)
-        check_button_v(controller, SDL_CONTROLLER_BUTTON_B, ptz.do_preset, 2)
-        check_button_v(controller, SDL_CONTROLLER_BUTTON_X, ptz.do_preset, 3)
-        check_button_v(controller, SDL_CONTROLLER_BUTTON_Y, ptz.do_preset, 4)
-        check_button_v(controller, SDL_CONTROLLER_BUTTON_LEFTSHOULDER, ptz.do_preset, 5)
-        check_button_v(controller, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, ptz.do_preset, 6)
-        check_button_v(controller, SDL_CONTROLLER_BUTTON_BACK, ptz.do_preset, 7)
-        check_button_v(controller, SDL_CONTROLLER_BUTTON_START, ptz.do_preset, 8)
+            check_button_v(controller, SDL_CONTROLLER_BUTTON_DPAD_LEFT, ptz.do_pan_step, -1)
+            check_button_v(controller, SDL_CONTROLLER_BUTTON_DPAD_RIGHT, ptz.do_pan_step)
+            check_button_v(controller, SDL_CONTROLLER_BUTTON_DPAD_UP, ptz.do_tilt_step)
+            check_button_v(controller, SDL_CONTROLLER_BUTTON_DPAD_DOWN, ptz.do_tilt_step, -1)
 
-        time.sleep(0.050)
+            check_button(controller, SDL_CONTROLLER_BUTTON_GUIDE, ptz.do_reset)
 
-    SDL_GameControllerClose(controller)
+            check_button_v(controller, SDL_CONTROLLER_BUTTON_A, ptz.do_preset, 1)
+            check_button_v(controller, SDL_CONTROLLER_BUTTON_B, ptz.do_preset, 2)
+            check_button_v(controller, SDL_CONTROLLER_BUTTON_X, ptz.do_preset, 3)
+            check_button_v(controller, SDL_CONTROLLER_BUTTON_Y, ptz.do_preset, 4)
+            check_button_v(controller, SDL_CONTROLLER_BUTTON_LEFTSHOULDER, ptz.do_preset, 5)
+            check_button_v(controller, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, ptz.do_preset, 6)
+            check_button_v(controller, SDL_CONTROLLER_BUTTON_BACK, ptz.do_preset, 7)
+            check_button_v(controller, SDL_CONTROLLER_BUTTON_START, ptz.do_preset, 8)
+
+            time.sleep(0.050)
+    finally:
+        if listener is not None:
+            listener.stop()
+
+    if viewer is not None:
+        viewer.close()
+    if controller is not None:
+        SDL_GameControllerClose(controller)
 
 if __name__ == '__main__':
     sys.exit(main())
