@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 
-import os, sys, ctypes, ctypes.util, logging, mmap, struct, getopt, select
+import os, sys, ctypes, ctypes.util, logging, mmap, struct, getopt, select, signal, time
 from fcntl import ioctl
 from threading import Thread
 from operator import lt, gt
 
-from cameractrls import CameraCtrls, PTZController
+from cameractrls import CameraCtrls, PTZController, find_by_text_id
 from cameractrls import v4l2_capability, v4l2_format, v4l2_streamparm, v4l2_requestbuffers, v4l2_buffer
 from cameractrls import VIDIOC_QUERYCAP, VIDIOC_G_FMT, VIDIOC_G_PARM, VIDIOC_S_PARM
 from cameractrls import VIDIOC_REQBUFS, VIDIOC_QUERYBUF, VIDIOC_QBUF, VIDIOC_DQBUF, VIDIOC_STREAMON, VIDIOC_STREAMOFF
@@ -163,6 +163,11 @@ SDL_WaitEvent.restype = ctypes.c_int
 SDL_WaitEvent.argtypes = [ctypes.c_void_p]
 # int SDL_WaitEvent(SDL_Event * event);
 
+SDL_WaitEventTimeout = sdl2.SDL_WaitEventTimeout
+SDL_WaitEventTimeout.restype = ctypes.c_int
+SDL_WaitEventTimeout.argtypes = [ctypes.c_void_p, ctypes.c_int]
+# int SDL_WaitEventTimeout(SDL_Event * event, int timeout);
+
 SDL_DestroyWindow = sdl2.SDL_DestroyWindow
 SDL_DestroyWindow.argtypes = [ctypes.c_void_p]
 # void SDL_DestroyWindow(SDL_Window * window);
@@ -174,6 +179,33 @@ SDL_SetWindowFullscreen = sdl2.SDL_SetWindowFullscreen
 SDL_SetWindowFullscreen.restype = ctypes.c_int
 SDL_SetWindowFullscreen.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
 # int SDL_SetWindowFullscreen(SDL_Window * window, Uint32 flags);
+
+SDL_SetWindowTitle = sdl2.SDL_SetWindowTitle
+SDL_SetWindowTitle.restype = None
+SDL_SetWindowTitle.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+# void SDL_SetWindowTitle(SDL_Window * window, const char *title);
+
+SDL_SetRenderDrawColor = sdl2.SDL_SetRenderDrawColor
+SDL_SetRenderDrawColor.restype = ctypes.c_int
+SDL_SetRenderDrawColor.argtypes = [ctypes.c_void_p, ctypes.c_uint8, ctypes.c_uint8, ctypes.c_uint8, ctypes.c_uint8]
+# int SDL_SetRenderDrawColor(SDL_Renderer * renderer, Uint8 r, Uint8 g, Uint8 b, Uint8 a);
+
+SDL_SetRenderDrawBlendMode = sdl2.SDL_SetRenderDrawBlendMode
+SDL_SetRenderDrawBlendMode.restype = ctypes.c_int
+SDL_SetRenderDrawBlendMode.argtypes = [ctypes.c_void_p, ctypes.c_int]
+# int SDL_SetRenderDrawBlendMode(SDL_Renderer * renderer, SDL_BlendMode blendMode);
+
+SDL_RenderFillRect = sdl2.SDL_RenderFillRect
+SDL_RenderFillRect.restype = ctypes.c_int
+SDL_RenderFillRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(SDL_Rect)]
+# int SDL_RenderFillRect(SDL_Renderer * renderer, const SDL_Rect * rect);
+
+SDL_GetTicks = sdl2.SDL_GetTicks
+SDL_GetTicks.restype = ctypes.c_uint32
+SDL_GetTicks.argtypes = []
+# Uint32 SDL_GetTicks(void);
+
+SDL_BLENDMODE_BLEND = 1
 
 SDL_ShowSimpleMessageBox = sdl2.SDL_ShowSimpleMessageBox
 SDL_ShowSimpleMessageBox.restype = ctypes.c_int
@@ -195,6 +227,7 @@ SDLK_6 = ord('6')
 SDLK_7 = ord('7')
 SDLK_8 = ord('8')
 SDLK_c = ord('c')
+SDLK_h = ord('h')
 SDLK_f = ord('f')
 SDLK_m = ord('m')
 SDLK_q = ord('q')
@@ -686,9 +719,34 @@ def V4L2Format2SDL(format):
     SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, b'Invalid pixel format', formats.encode(), None)
     sys.exit(3)
 
+# 5x7 glyphs for the key hint, one string of 7 rows per letter
+HINT_FONT = {
+    'A': '01110 10001 10001 11111 10001 10001 10001',
+    'C': '01110 10001 10000 10000 10000 10001 01110',
+    'D': '11110 10001 10001 10001 10001 10001 11110',
+    'E': '11111 10000 10000 11110 10000 10000 11111',
+    'F': '11111 10000 10000 11110 10000 10000 10000',
+    'H': '10001 10001 10001 11111 10001 10001 10001',
+    'I': '01110 00100 00100 00100 00100 00100 01110',
+    'L': '10000 10000 10000 10000 10000 10000 11111',
+    'M': '10001 11011 10101 10101 10001 10001 10001',
+    'N': '10001 11001 10101 10011 10001 10001 10001',
+    'O': '01110 10001 10001 10001 10001 10001 01110',
+    'P': '11110 10001 10001 11110 10000 10000 10000',
+    'Q': '01110 10001 10001 10001 10101 10010 01101',
+    'R': '11110 10001 10001 11110 10100 10010 10001',
+    'S': '01111 10000 10000 01110 00001 00001 11110',
+    'T': '11111 00100 00100 00100 00100 00100 00100',
+    'U': '10001 10001 10001 10001 10001 10001 01110',
+}
+HINT_TEXT = 'F FULLSCREEN   R ROTATE   M MIRROR   C COLORMAP   H HIDE HINT   Q QUIT'
+HINT_SHOW_MS = 5000
+
 class SDLCameraWindow():
-    def __init__(self, device, win_width, win_height, angle, flip, colormap):
+    def __init__(self, device, win_width, win_height, angle, flip, colormap, quit_after = None):
         self.returncode = 0
+        self.quit_deadline = None if quit_after is None else time.monotonic() + quit_after
+        self.quit_requested = False
         self.cam = V4L2Camera(device)
         self.cam.pipe = self
         self.ctrls = CameraCtrls(device, self.cam.fd)
@@ -741,7 +799,7 @@ class SDLCameraWindow():
         self.camera_error_event = SDL_Event()
         self.camera_error_event.type = self.sdl_camera_error_event
 
-        self.window = SDL_CreateWindow(device.encode(), SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, win_width, win_height, SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI)
+        self.window = SDL_CreateWindow(self.window_title(device).encode(), SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, win_width, win_height, SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI)
         if self.window is None:
             logging.error(f'SDL_CreateWindow failed: {SDL_GetError()}')
             sys.exit(1)
@@ -749,6 +807,11 @@ class SDLCameraWindow():
         if self.renderer is None:
             logging.error(f'SDL_CreateRenderer failed: {SDL_GetError()}')
             sys.exit(1)
+
+        self.logical_size = (self.cam.width, self.cam.height)
+        self.hint_visible = True
+        self.hint_toggle_requested = False
+        self.hint_deadline = SDL_GetTicks() + HINT_SHOW_MS
 
         self.rotate(angle)
         self.mirror(flip)
@@ -769,6 +832,42 @@ class SDLCameraWindow():
             self.colormaps = {k: v for k, v in self.colormaps.items() if k != 'grayscale'}
 
         self.set_colormap(colormap)
+
+    def window_title(self, device):
+        card = find_by_text_id(self.ctrls.get_ctrls(), 'card')
+        name = card.value.split(': ')[0] if card is not None and card.value else device
+        fps = self.ctrls.fmt_ctrls.get_fps()
+        rate = f' @ {fps} fps' if fps else ''
+        return f'{name}  {self.cam.width}x{self.cam.height}{rate}'
+
+    def toggle_hint(self):
+        self.hint_visible = not self.hint_visible
+        self.hint_deadline = None
+
+    def draw_hint(self):
+        if not self.hint_visible:
+            return
+        if self.hint_deadline is not None and SDL_GetTicks() >= self.hint_deadline:
+            self.hint_visible = False
+            return
+        lw, lh = self.logical_size
+        scale = max(1, min(6, int(lw * 0.9) // (len(HINT_TEXT) * 6)))
+        pad = 2 * scale
+        text_w = len(HINT_TEXT) * 6 * scale - scale
+        bar = SDL_Rect((lw - text_w) // 2 - pad, lh - 7 * scale - 3 * pad, text_w + 2 * pad, 7 * scale + 2 * pad)
+        SDL_SetRenderDrawBlendMode(self.renderer, SDL_BLENDMODE_BLEND)
+        SDL_SetRenderDrawColor(self.renderer, 0, 0, 0, 170)
+        SDL_RenderFillRect(self.renderer, ctypes.byref(bar))
+        SDL_SetRenderDrawColor(self.renderer, 255, 255, 255, 255)
+        for i, ch in enumerate(HINT_TEXT):
+            rows = HINT_FONT.get(ch)
+            if rows is None:
+                continue
+            for y, row in enumerate(rows.split()):
+                for x, bit in enumerate(row):
+                    if bit == '1':
+                        dot = SDL_Rect(bar.x + pad + (i * 6 + x) * scale, bar.y + pad + y * scale, scale, scale)
+                        SDL_RenderFillRect(self.renderer, ctypes.byref(dot))
 
     def write_buf(self, buf):
         if buf is None:
@@ -797,7 +896,19 @@ class SDLCameraWindow():
 
     def event_loop(self):
         event = SDL_Event()
-        while SDL_WaitEvent(ctypes.byref(event)) != 0:
+        while not self.quit_requested:
+            # wake up regularly so a SIGINT/SIGTERM handler gets to run
+            if self.hint_toggle_requested:
+                self.hint_toggle_requested = False
+                self.toggle_hint()
+            if self.quit_deadline is not None and time.monotonic() >= self.quit_deadline:
+                # test hook: goes through the same SDL_QUIT path as the window's close button
+                self.quit_deadline = None
+                quit_event = SDL_Event()
+                quit_event.type = SDL_QUIT
+                SDL_PushEvent(ctypes.byref(quit_event))
+            if SDL_WaitEventTimeout(ctypes.byref(event), 100) == 0:
+                continue
             if event.type == SDL_QUIT:
                 self.stop_capturing()
                 break
@@ -814,6 +925,8 @@ class SDLCameraWindow():
                     self.mirror(1 if not shift else -1)
                 elif event.key.keysym.sym == SDLK_c:
                     self.step_colormap(1 if not shift else -1)
+                elif event.key.keysym.sym == SDLK_h:
+                    self.toggle_hint()
             elif event.type == SDL_MOUSEBUTTONUP and \
                 event.button.button == SDL_BUTTON_LEFT and \
                 event.button.clicks == 2:
@@ -825,6 +938,7 @@ class SDLCameraWindow():
                     logging.warning(f'SDL_RenderClear failed: {SDL_GetError()}')
                 if SDL_RenderCopyEx(self.renderer, self.texture, None, self.dstrect, self.angle, None, self.flip) != 0:
                     logging.warning(f'SDL_RenderCopy failed: {SDL_GetError()}')
+                self.draw_hint()
                 SDL_RenderPresent(self.renderer)
             elif event.type == self.sdl_new_grey_image_event:
                 self.surface[0].pixels = event.user.data1
@@ -836,6 +950,7 @@ class SDLCameraWindow():
                     logging.warning(f'SDL_RenderClear failed: {SDL_GetError()}')
                 if SDL_RenderCopyEx(self.renderer, texture, None, self.dstrect, self.angle, None, self.flip) != 0:
                     logging.warning(f'SDL_RenderCopy failed: {SDL_GetError()}')
+                self.draw_hint()
                 SDL_RenderPresent(self.renderer)
                 SDL_DestroyTexture(texture)
             elif event.type == self.sdl_camera_error_event:
@@ -921,6 +1036,7 @@ class SDLCameraWindow():
         self.angle %= 360
         if self.angle % 180 == 0:
             self.dstrect = None
+            self.logical_size = (self.cam.width, self.cam.height)
             if SDL_RenderSetLogicalSize(self.renderer, self.cam.width, self.cam.height) != 0:
                 logging.warning(f'SDL_RenderSetlogicalSize failed: {SDL_GetError()}')
         else:
@@ -930,6 +1046,7 @@ class SDLCameraWindow():
                 self.cam.width,
                 self.cam.height
             )
+            self.logical_size = (self.cam.height, self.cam.width)
             if SDL_RenderSetLogicalSize(self.renderer, self.cam.height, self.cam.width) != 0:
                 logging.warning(f'SDL_RenderSetlogicalSize failed: {SDL_GetError()}')
         self.match_window_to_logical()
@@ -975,14 +1092,23 @@ class SDLCameraWindow():
     def start_capturing(self):
         self.cam.start()
         self.event_loop()
+        # also covers the signal exit, where the loop ends without stopping the thread
+        self.stop_capturing()
 
     def stop_capturing(self):
         self.cam.stop()
+
+    def request_quit(self, *_):
+        self.quit_requested = True
+
+    def request_hint_toggle(self, *_):
+        self.hint_toggle_requested = True
 
     def close(self):
         tj_destroy(self.tj)
         SDL_DestroyWindow(self.window)
         SDL_Quit()
+        os.close(self.cam.fd)
         return self.returncode
 
 
@@ -995,6 +1121,7 @@ def usage():
     print(f'  -r ANGLE           rotate the image by ANGLE, default 0')
     print(f'  -m FLIP            mirror the image by FLIP, default no, (no, h, v, hv)')
     print(f'  -c COLORMAP        set colormap, default none')
+    print(f'  --quit-after SECS  close the window after SECS seconds (for tests)')
     print(f'                    (none, grayscale, inferno, viridis, ironblack, rainbow)')
     print()
     print(f'example:')
@@ -1005,11 +1132,13 @@ def usage():
     print(f'  r: ANGLE +90 (shift+r -90)')
     print(f'  m: FLIP next (shift+m prev)')
     print(f'  c: COLORMAP next (shift+c prev)')
+    print(f'  h: show/hide the key hint')
+    print(f'  q, esc: close')
 
 
 def main():
     try:
-        arguments, values = getopt.getopt(sys.argv[1:], 'hd:s:r:m:c:', ['help'])
+        arguments, values = getopt.getopt(sys.argv[1:], 'hd:s:r:m:c:', ['help', 'quit-after='])
     except getopt.error as err:
         print(err)
         usage()
@@ -1021,6 +1150,7 @@ def main():
     angle = 0
     flip = 0
     colormap = 'none'
+    quit_after = None
 
     for current_argument, current_value in arguments:
         if current_argument in ('-h', '--help'):
@@ -1050,12 +1180,17 @@ def main():
                 logging.warning(f'invalid FLIP value: {current_value}')
         elif current_argument == '-c':
             colormap = current_value
+        elif current_argument == '--quit-after':
+            quit_after = float(current_value)
 
 
     os.environ['SDL_VIDEO_X11_WMCLASS'] = 'hu.irl.cameractrls'
     os.environ['SDL_VIDEO_WAYLAND_WMCLASS'] = 'hu.irl.cameractrls'
 
-    win = SDLCameraWindow(device, width, height, angle, flip, colormap)
+    win = SDLCameraWindow(device, width, height, angle, flip, colormap, quit_after)
+    signal.signal(signal.SIGINT, win.request_quit)
+    signal.signal(signal.SIGTERM, win.request_quit)
+    signal.signal(signal.SIGUSR1, win.request_hint_toggle)
     win.start_capturing()
     return win.close()
 
