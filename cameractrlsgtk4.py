@@ -19,6 +19,16 @@ PREVIEW_MISSING = ('Live preview needs GStreamer with v4l2src, jpegdec and gtk4p
 #logging.getLogger().setLevel(logging.INFO)
 
 class CameraCtrlsWindow(Gtk.ApplicationWindow):
+    def apply_color_scheme(self, portal_value):
+        """Portal color-scheme: 0 no preference, 1 prefer dark, 2 prefer light."""
+        settings = self.get_settings()
+        if settings.find_property('gtk-interface-color-scheme') is not None:
+            scheme = {1: Gtk.InterfaceColorScheme.DARK, 2: Gtk.InterfaceColorScheme.LIGHT}.get(
+                portal_value, Gtk.InterfaceColorScheme.DEFAULT)
+            settings.set_property('gtk-interface-color-scheme', scheme)
+        else:
+            settings.set_property('gtk-application-prefer-dark-theme', portal_value == 1)
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.devices = []
@@ -129,13 +139,12 @@ class CameraCtrlsWindow(Gtk.ApplicationWindow):
                 Gio.BusType.SESSION, Gio.DBusProxyFlags.NONE, None,
                 'org.freedesktop.portal.Desktop', '/org/freedesktop/portal/desktop',
                 'org.freedesktop.portal.Settings', None)
-            prefer_dark = self.desktop_portal.Read('(ss)', 'org.freedesktop.appearance', 'color-scheme') == 1
-            self.get_settings().set_property('gtk-application-prefer-dark-theme', prefer_dark)
+            self.apply_color_scheme(self.desktop_portal.Read('(ss)', 'org.freedesktop.appearance', 'color-scheme'))
             self.desktop_portal.connect('g-signal', lambda p, sender, signal, params:
                 signal == 'SettingChanged' and
                 params[0] == 'org.freedesktop.appearance' and
                 params[1] == 'color-scheme' and
-                self.get_settings().set_property('gtk-application-prefer-dark-theme', params[2] == 1)
+                self.apply_color_scheme(params[2])
             )
         except Exception as e:
             logging.warning(f'desktop_portal failed: {e}')
