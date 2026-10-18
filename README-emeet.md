@@ -140,9 +140,39 @@ Buttons: `a b x y back guide start leftstick rightstick leftshoulder rightshould
 
 ## Picture quality, measured
 
-Presets: 1 Stream (aperture-priority exposure, fixed focus 384, white balance 5500, zoom 0, sharpness 128), 2 "60fps (light)" (manual exposure 156 plus gain 50: this camera holds 60 fps only in manual mode, and in my basement that is dark without a key light), 3 Quality (aperture priority, sharpness 160, 4K30 MJPG capture saved with the format), 4 Natural (the camera's defaults with continuous focus and white balance locked at 5500). A lit-room rerun on 2026-10-15 corrected the dark-room table below: aperture priority and manual 156 both sat at luma 99 while the camera happened to be running its own exposure, and once mode writes really took effect manual 156 at gain 0 fell to luma 16. Sharpness 160 is neutral on the edge metric in light (76 vs 78), 200 doubles it (132) at the same noise and is worth an eye check before trusting, contrast 144 adds a little (82) but darkens, gain and saturation changes buy nothing in light. All four are in `tools/emeet-presets.ini`; append it to the device ini in `~/.config/hu.irl.cameractrls/` (host) or `~/.var/app/hu.irl.cameractrls/config/hu.irl.cameractrls/` (Flatpak). Loading a preset applies the auto switches (exposure, white balance, focus) first, inside a short stream, so a preset with a manual focus value loads clean while continuous focus is on.
+Presets: 1 Stream (aperture-priority exposure, fixed focus 384, white balance 5500, zoom 0, sharpness 160), 2 "60fps (light)" (manual exposure 156, gain 100, brightness 160: this camera holds 60 fps only in manual mode, and without a key light that is the brightest 60 fps my basement gives, still dim and grainy next to preset 1), 3 Quality (aperture priority, sharpness 200, 4K30 MJPG capture saved with the format), 4 Natural (the camera's defaults with continuous focus and white balance locked at 5500). The 2026-10-17 lit-room run below is where the sharpness and preset 2 numbers come from. Loading a preset applies the auto switches (exposure, white balance, focus) first, inside a short stream, so a preset with a manual focus value loads clean while continuous focus is on.
 
 `tools/measure.py IMAGE...` prints sharpness (variance of the Laplacian on the centre crop, higher is sharper), noise (std of the high-pass residual in the flattest tiles, lower is cleaner), the grey-world R/G and B/G, a rough colour temperature and mean luma. It only reads image files. Every row below is the median of three 1.5 s ffmpeg grabs at 1920x1080 (the 4K row is a 3840x2160 grab downscaled with Lanczos) with one setting changed from the Stream baseline.
+
+### Measured on 2026-10-17, lit basement, person in frame
+
+Ceiling light on, me in the chair at the usual distance, one 1080p grab per setting after a 7 s settle with the stream held open (the camera only takes an exposure-mode write while streaming). Frame counts are from a separate 3 s ffmpeg pull at a 60 fps request. Sharpness and noise from `tools/measure.py` on the centre crop.
+
+| setting | frames in 3 s | luma | sharp | noise |
+|---|---|---|---|---|
+| aperture priority, sharpness 128 | 100 | 110 | 63 | 0.42 |
+| aperture priority, sharpness 160 | 100 | 110 | 78 | 0.44 |
+| aperture priority, sharpness 200 | 100 | 110 | 107 | 0.44 |
+| aperture priority, sharpness 255 | 100 | 110 | 143 | 0.43 |
+| aperture priority, backlight compensation 2 | 91 | 112 | 31 | 0.44 |
+| aperture priority, gamma 160 | 100 | 111 | 43 | 0.42 |
+| manual 156, gain 0 | 178 | 17 | 1 | 0.01 |
+| manual 156, gain 50 | 178 | 50 | 17 | 0.23 |
+| manual 156, gain 75 | 178 | 61 | 34 | 0.30 |
+| manual 156, gain 100 | 178 | 75 | 31 | 0.36 |
+| manual 156, gain 100, brightness 160 | 178 | 88 | 55 | 0.40 |
+| manual 156, gain 100, brightness 192 | 178 | 104 | 53 | 0.43 |
+| manual 156, gain 100, gamma 160 | 178 | 73 | 44 | 0.37 |
+| manual 300, gain 0 | 101 | 22 | 3 | 0.08 |
+| manual 625, gain 0 | 50 | 33 | 8 | 0.14 |
+| manual 100, gain 100 | 178 | 57 | 20 | 0.31 |
+
+What it says:
+
+- Exposure writes are honoured in manual mode: 156 gives a true 60 fps, 300 gives 33, 625 gives 16. Aperture priority settles at about 33 fps in this light however bright the room looks, so 60 fps is a manual-mode thing.
+- Sharpness is free on the noise metric all the way up. By eye, 160 cleans up the soft default, 200 is crisper with no visible halo at the facecam size, 255 crunches hair and glasses edges. Stream takes 160, Quality takes 200.
+- Gain lifts a manual frame roughly linearly (luma 17, 50, 61, 75 at 0, 50, 75, 100) and the noise metric stays under the aperture-priority figure. Brightness then lifts the whole frame; 192 reaches the aperture-priority luma on paper, but by eye the face stays dim and the blacks go grey, so the metric overstates it. Preset 2 takes gain 100 with brightness 160 as the least bad 60 fps without a key light. Gamma did nothing useful.
+- Backlight compensation 2 cut the edge metric in half at the same brightness, so it stays at 1.
 
 ### Measured on 2026-10-15, dark basement
 

@@ -278,8 +278,8 @@ for N in 3 4; do
     step test ! -s "$TMP/qload$N.out"
 done
 XDG_CONFIG_HOME="$QCONF" "${CLI[@]}" -c "preset=load_3" >/dev/null 2>&1
-DESC="preset 3 sets sharpness 160 and aperture priority"
-step bash -c '"$@" -l | grep -qE "^ sharpness = 160" ' _ "${CLI[@]}"
+DESC="preset 3 sets sharpness 200 and aperture priority"
+step bash -c '"$@" -l | grep -qE "^ sharpness = 200" ' _ "${CLI[@]}"
 "${CLI[@]}" -c "$RESTORE" >"$TMP/qrestore.out" 2>&1
 DESC="live controls put back after the preset loads (stderr: $(head -c 80 "$TMP/qrestore.out"))"
 step test ! -s "$TMP/qrestore.out"
